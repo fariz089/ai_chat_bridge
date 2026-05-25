@@ -1,0 +1,13 @@
+{
+  "api_port": 5100,
+  "api_key": "kuda",
+  "last_labels": {
+    "chatgpt": "default"
+  },
+  "real_chrome": {
+    "enabled": true,
+    "profile": "25",
+    "exe": "",
+    "user_data": ""
+  }
+}

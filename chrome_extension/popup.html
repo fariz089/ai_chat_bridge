@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      width: 340px;
+      font-family: 'Segoe UI', -apple-system, sans-serif;
+      background: #1a1a2e;
+      color: #e0e0e0;
+      padding: 16px;
+    }
+    h1 {
+      font-size: 15px;
+      text-align: center;
+      margin-bottom: 4px;
+      color: #00d4aa;
+    }
+    .subtitle {
+      font-size: 11px;
+      text-align: center;
+      color: #888;
+      margin-bottom: 14px;
+    }
+    .platform-card {
+      background: #16213e;
+      border: 1px solid #0f3460;
+      border-radius: 10px;
+      padding: 14px;
+      margin-bottom: 10px;
+    }
+    .platform-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+    .platform-icon {
+      width: 28px;
+      height: 28px;
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 16px;
+      font-weight: bold;
+      color: white;
+    }
+    .platform-icon.chatgpt { background: #10a37f; }
+    .platform-icon.grok { background: #1d9bf0; }
+    .platform-name {
+      font-weight: 600;
+      font-size: 14px;
+    }
+    .platform-status {
+      margin-left: auto;
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 10px;
+      background: #333;
+    }
+    .platform-status.detected { background: #0d4f3c; color: #00d4aa; }
+    .platform-status.not-detected { background: #4a1c1c; color: #ff6b6b; }
+    .label-row {
+      display: flex;
+      gap: 6px;
+      margin-bottom: 8px;
+    }
+    .label-row input {
+      flex: 1;
+      padding: 6px 10px;
+      border-radius: 6px;
+      border: 1px solid #0f3460;
+      background: #0a0f1e;
+      color: #e0e0e0;
+      font-size: 12px;
+      outline: none;
+    }
+    .label-row input:focus { border-color: #00d4aa; }
+    .btn {
+      width: 100%;
+      padding: 8px;
+      border: none;
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity 0.2s;
+    }
+    .btn:hover { opacity: 0.85; }
+    .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn-capture {
+      background: linear-gradient(135deg, #00d4aa, #00b894);
+      color: #000;
+    }
+    .btn-capture.grok-btn {
+      background: linear-gradient(135deg, #1d9bf0, #0d8bd9);
+      color: #fff;
+    }
+    .settings {
+      background: #16213e;
+      border: 1px solid #0f3460;
+      border-radius: 10px;
+      padding: 12px;
+      margin-bottom: 10px;
+    }
+    .settings-title {
+      font-size: 12px;
+      font-weight: 600;
+      margin-bottom: 8px;
+      color: #aaa;
+    }
+    .settings-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-bottom: 6px;
+    }
+    .settings-row label {
+      font-size: 12px;
+      flex-shrink: 0;
+    }
+    .settings-row input {
+      flex: 1;
+      padding: 5px 8px;
+      border-radius: 5px;
+      border: 1px solid #0f3460;
+      background: #0a0f1e;
+      color: #e0e0e0;
+      font-size: 12px;
+      outline: none;
+    }
+    #log {
+      background: #0a0f1e;
+      border: 1px solid #0f3460;
+      border-radius: 8px;
+      padding: 8px;
+      font-size: 11px;
+      font-family: 'Consolas', monospace;
+      max-height: 100px;
+      overflow-y: auto;
+      color: #888;
+      line-height: 1.5;
+    }
+    #log .ok { color: #00d4aa; }
+    #log .err { color: #ff6b6b; }
+    #log .info { color: #1d9bf0; }
+  </style>
+</head>
+<body>
+  <h1>🤖 AI Chat Bridge</h1>
+  <p class="subtitle">Capture sessions for ChatGPT & Grok</p>
+
+  <!-- ChatGPT -->
+  <div class="platform-card">
+    <div class="platform-header">
+      <div class="platform-icon chatgpt">G</div>
+      <span class="platform-name">ChatGPT</span>
+      <span class="platform-status not-detected" id="status-chatgpt">Not Detected</span>
+    </div>
+    <div class="label-row">
+      <input type="text" id="label-chatgpt" placeholder="Label (optional, e.g. work)" />
+    </div>
+    <button class="btn btn-capture" id="btn-chatgpt" disabled>Capture ChatGPT Session</button>
+  </div>
+
+  <!-- Grok -->
+  <div class="platform-card">
+    <div class="platform-header">
+      <div class="platform-icon grok">X</div>
+      <span class="platform-name">Grok</span>
+      <span class="platform-status not-detected" id="status-grok">Not Detected</span>
+    </div>
+    <div class="label-row">
+      <input type="text" id="label-grok" placeholder="Label (optional, e.g. personal)" />
+    </div>
+    <button class="btn btn-capture grok-btn" id="btn-grok" disabled>Capture Grok Session</button>
+  </div>
+
+  <!-- Settings -->
+  <div class="settings">
+    <div class="settings-title">⚙️ Bridge Server</div>
+    <div class="settings-row">
+      <label>Host:</label>
+      <input type="text" id="server-host" value="http://127.0.0.1" />
+    </div>
+    <div class="settings-row">
+      <label>Port:</label>
+      <input type="text" id="server-port" value="5098" />
+    </div>
+  </div>
+
+  <!-- Log -->
+  <div id="log"></div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
