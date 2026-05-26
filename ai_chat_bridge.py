@@ -102,12 +102,14 @@ class AIChatBridgeApp:
         # Image references (PhotoImage) for inline thumbnails — keep alive
         self._chat_images: list = []
 
-        # Persistent bridge worker — created lazily, kept alive across sends.
-        # All Playwright ops run inside its dedicated thread (required because
-        # Playwright's sync API is thread-bound).
-        self._bridge = None
-        self._bridge_headless = None      # remember the headless setting in use
-        self._chat_busy = False           # block concurrent sends
+        # Per-platform bridge workers — each platform gets its OWN worker so
+        # ChatGPT and Grok browsers can run SIMULTANEOUSLY without needing to
+        # close one before opening the other.
+        self._bridges: dict[str, object] = {"chatgpt": None, "grok": None}
+        self._bridge_headless: dict[str, bool] = {"chatgpt": None, "grok": None}
+        self._chat_busy: dict[str, bool] = {"chatgpt": False, "grok": False}
+        # Keep legacy alias so _poll_browser_status still works during refactor
+        self._bridge = None  # unused — kept to avoid AttributeError on old refs
 
         SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
         MEDIA_DIR.mkdir(parents=True, exist_ok=True)
@@ -121,11 +123,12 @@ class AIChatBridgeApp:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _on_close(self):
-        try:
-            if self._bridge:
-                self._bridge.shutdown(wait=True, timeout=5)
-        except Exception:
-            pass
+        for bridge in self._bridges.values():
+            try:
+                if bridge:
+                    bridge.shutdown(wait=True, timeout=5)
+            except Exception:
+                pass
         try:
             if self._api_process:
                 self._api_process.terminate()
@@ -143,28 +146,34 @@ class AIChatBridgeApp:
             self.root.after(2000, self._poll_session_files)
 
     def _poll_browser_status(self):
-        """Update the 'browser status' indicator in the chat tab."""
+        """Update browser status indicators for both platforms."""
         try:
-            if self._bridge is None:
-                self.chat_status_var.set("● Browser: not started — first message will launch it")
-                self.chat_status_lbl.configure(foreground="#888")
-            else:
-                # list_active_sessions() reads a snapshot — non-blocking
-                active = self._bridge.list_active_sessions()
-                if not active:
-                    self.chat_status_var.set("● Browser: closed (worker alive, will re-launch on next send)")
-                    self.chat_status_lbl.configure(foreground="#888")
+            for pk in ("chatgpt", "grok"):
+                bridge = self._bridges.get(pk)
+                var = getattr(self, f"chat_status_var_{pk}", None)
+                lbl = getattr(self, f"chat_status_lbl_{pk}", None)
+                if var is None:
+                    continue
+                if bridge is None:
+                    var.set("● not started")
+                    if lbl:
+                        lbl.configure(foreground="#888")
                 else:
-                    lines = []
-                    for s in active:
-                        url = s.get("url") or "(no url)"
-                        if len(url) > 50:
-                            url = url[:47] + "..."
-                        lines.append(
-                            f"● {s['platform']}  msgs={s['message_count']}  {url}"
-                        )
-                    self.chat_status_var.set("  |  ".join(lines))
-                    self.chat_status_lbl.configure(foreground="#73d13d")
+                    active = bridge.list_active_sessions()
+                    if not active:
+                        var.set("● closed (will re-launch on next send)")
+                        if lbl:
+                            lbl.configure(foreground="#888")
+                    else:
+                        parts = []
+                        for s in active:
+                            url = s.get("url") or ""
+                            if len(url) > 50:
+                                url = url[:47] + "..."
+                            parts.append(f"● msgs={s['message_count']}  {url}")
+                        var.set("  |  ".join(parts))
+                        if lbl:
+                            lbl.configure(foreground="#73d13d")
         except Exception:
             pass
         finally:
@@ -429,73 +438,37 @@ class AIChatBridgeApp:
         return widgets
 
     def _build_chat_tab(self, parent):
-        # ── Row 1: Platform + Label + Options (single compact row) ──
-        top = ttk.Frame(parent)
-        top.pack(fill="x", pady=(0, 4))
-        ttk.Label(top, text="Platform:").pack(side="left", padx=(0, 4))
-        self.chat_platform_var = tk.StringVar(value="grok")
-        platform_combo = ttk.Combobox(top, textvariable=self.chat_platform_var,
-                                       values=["chatgpt", "grok"], width=10, state="readonly")
-        platform_combo.pack(side="left", padx=(0, 8))
-        platform_combo.bind("<<ComboboxSelected>>", lambda e: self._on_chat_target_changed())
-
-        ttk.Label(top, text="Label:").pack(side="left", padx=(0, 4))
-        self.chat_label_var = tk.StringVar(value="default")
-        label_entry = ttk.Entry(top, textvariable=self.chat_label_var, width=12)
-        label_entry.pack(side="left", padx=(0, 8))
-        label_entry.bind("<FocusOut>", lambda e: self._on_chat_target_changed())
+        """Build Chat tab with two sub-tabs: ChatGPT and Grok (run simultaneously)."""
+        # Shared options bar (headless, debug, CDP apply to both)
+        opts_bar = ttk.Frame(parent)
+        opts_bar.pack(fill="x", pady=(0, 6))
 
         self.chat_headless_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(top, text="Headless", variable=self.chat_headless_var,
-                        command=self._on_headless_toggle).pack(side="left", padx=(0, 6))
+        ttk.Checkbutton(opts_bar, text="Headless", variable=self.chat_headless_var).pack(
+            side="left", padx=(0, 6))
         self.chat_debug_phases_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(top, text="Debug screenshots",
+        ttk.Checkbutton(opts_bar, text="Debug screenshots",
                         variable=self.chat_debug_phases_var).pack(side="left", padx=(0, 8))
-
-        # CDP + Session controls on same row
         self.chat_cdp_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(top, text="CDP", variable=self.chat_cdp_var,
+        ttk.Checkbutton(opts_bar, text="CDP", variable=self.chat_cdp_var,
                         command=self._on_cdp_toggle).pack(side="left", padx=(0, 2))
         self.chat_cdp_port_var = tk.StringVar(value="9222")
-        ttk.Entry(top, textvariable=self.chat_cdp_port_var, width=5).pack(side="left", padx=(0, 8))
+        ttk.Entry(opts_bar, textvariable=self.chat_cdp_port_var, width=5).pack(
+            side="left", padx=(0, 8))
+        ttk.Label(opts_bar, text="(Both browsers run simultaneously)",
+                  foreground="#888", font=("Segoe UI", 9, "italic")).pack(side="left")
 
-        # Session buttons on same row (right side)
-        ttk.Button(top, text="New Chat",
-                   command=self._new_chat).pack(side="right", padx=(4, 0))
-        ttk.Button(top, text="Close Browser",
-                   command=self._close_browser).pack(side="right", padx=(4, 0))
-        ttk.Button(top, text="Clear",
-                   command=self._clear_chat_display).pack(side="right", padx=(4, 0))
-
-        # ── Row 2: Status + Imagine toggle ──
-        row2 = ttk.Frame(parent)
-        row2.pack(fill="x", pady=(0, 4))
-
-        self.chat_status_var = tk.StringVar(value="● not started")
-        self.chat_status_lbl = ttk.Label(row2, textvariable=self.chat_status_var,
-                                          foreground="#909296", font=("Segoe UI", 9, "italic"))
-        self.chat_status_lbl.pack(side="left")
-
-        # Grok Imagine — compact inline
+        # Imagine options (Grok-only, shown when enabled)
         self.imagine_enabled_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(row2, text="Grok Imagine",
-                        variable=self.imagine_enabled_var,
-                        command=self._on_imagine_toggle).pack(side="right", padx=(8, 0))
-
-        # Imagine options (hidden by default, shown inline when enabled)
         self.imagine_frame = ttk.Frame(parent)
-        # Don't pack yet — will be shown when imagine is enabled
-
         self.imagine_opts_frame = ttk.Frame(self.imagine_frame)
         self.imagine_opts_frame.pack(fill="x")
-
         ttk.Label(self.imagine_opts_frame, text="Mode:").pack(side="left", padx=(0, 4))
         self.imagine_mode_var = tk.StringVar(value="image")
         mode_combo = ttk.Combobox(self.imagine_opts_frame, textvariable=self.imagine_mode_var,
                                    values=["image", "video"], width=7, state="readonly")
         mode_combo.pack(side="left", padx=(0, 10))
         mode_combo.bind("<<ComboboxSelected>>", lambda e: self._on_imagine_mode_changed())
-
         ttk.Label(self.imagine_opts_frame, text="Aspect:").pack(side="left", padx=(0, 4))
         self.imagine_aspect_var = tk.StringVar(value="9:16")
         aspect_combo = ttk.Combobox(self.imagine_opts_frame, textvariable=self.imagine_aspect_var,
@@ -504,96 +477,522 @@ class AIChatBridgeApp:
                                      width=14, state="readonly")
         aspect_combo.pack(side="left", padx=(0, 10))
         aspect_combo.set("9:16 (Vertical)")
-
         ttk.Label(self.imagine_opts_frame, text="Quality:").pack(side="left", padx=(0, 4))
         self.imagine_res_var = tk.StringVar(value="720p")
         ttk.Radiobutton(self.imagine_opts_frame, text="Speed",
                         variable=self.imagine_res_var, value="480p").pack(side="left", padx=(0, 2))
         ttk.Radiobutton(self.imagine_opts_frame, text="Quality",
                         variable=self.imagine_res_var, value="720p").pack(side="left", padx=(0, 10))
-
         self.imagine_dur_var = tk.StringVar(value="6s")
-        self.imagine_quality_row = ttk.Frame(self.imagine_opts_frame)  # dummy for compat
-        self.imagine_video_row = ttk.Frame(self.imagine_opts_frame)    # dummy for compat
-
+        self.imagine_quality_row = ttk.Frame(self.imagine_opts_frame)
+        self.imagine_video_row = ttk.Frame(self.imagine_opts_frame)
         self._on_imagine_mode_changed()
 
-        # ── Chat display (main area) ──
-        chat_frame = ttk.Frame(parent)
-        chat_frame.pack(fill="both", expand=True, pady=(0, 4))
-        self.chat_display = tk.Text(chat_frame, wrap="word",
-                                    background="#1a1b1e",
-                                    foreground="#c1c2c5",
-                                    font=("Cascadia Code", 10),
-                                    state="disabled", cursor="arrow",
-                                    relief="flat", bd=0,
-                                    selectbackground="#339af0",
-                                    selectforeground="#fff",
-                                    padx=10, pady=8)
-        chat_scroll = ttk.Scrollbar(chat_frame, command=self.chat_display.yview)
-        self.chat_display.configure(yscrollcommand=chat_scroll.set)
-        chat_scroll.pack(side="right", fill="y")
-        self.chat_display.pack(side="left", fill="both", expand=True)
-        self.chat_display.tag_config("user", foreground="#58a6ff")
-        self.chat_display.tag_config("ai", foreground="#7ee787")
-        self.chat_display.tag_config("system", foreground="#8b949e")
-        self.chat_display.tag_config("attachment", foreground="#d2a8ff")
-        self.chat_display.tag_config("media", foreground="#ffa657")
-        self.chat_display.tag_config("link", foreground="#58a6ff", underline=True)
-        self.chat_display.tag_config("divider", foreground="#444")
+        # Sub-notebook: one tab per platform
+        self.chat_platform_notebook = ttk.Notebook(parent)
+        self.chat_platform_notebook.pack(fill="both", expand=True)
 
-        # ── Bottom bar: input + attachments ──
-        bottom = ttk.Frame(parent)
-        bottom.pack(fill="x", pady=(0, 0))
+        self._platform_panels = {}
+        platform_configs = [
+            ("chatgpt", "🟢 ChatGPT", "#10a37f"),
+            ("grok",    "⚡ Grok",    "#1d9bf0"),
+        ]
+        for pk, tab_label, accent in platform_configs:
+            pf = ttk.Frame(self.chat_platform_notebook, padding=6)
+            self.chat_platform_notebook.add(pf, text=f"  {tab_label}  ")
+            self._build_platform_chat_panel(pf, pk, accent)
 
-        # Attachment buttons (compact)
-        att_row = ttk.Frame(bottom)
-        att_row.pack(fill="x", pady=(0, 2))
-        self.attach_list_frame = ttk.Frame(att_row)
-        self.attach_list_frame.pack(side="left", fill="x", expand=True)
-        ttk.Button(att_row, text="+ File",
-                   command=lambda: self._add_attachment("any")).pack(side="right", padx=(2, 0))
-        ttk.Button(att_row, text="+ Image",
-                   command=lambda: self._add_attachment("image")).pack(side="right", padx=(2, 0))
-        ttk.Button(att_row, text="Clear",
-                   command=self._clear_attachments).pack(side="right", padx=(2, 0))
-        ttk.Button(att_row, text="Media ↗",
-                   command=self._open_media_folder).pack(side="right", padx=(2, 0))
+        # Keep compat aliases pointing to Grok (legacy batch_zip etc.)
+        self.chat_platform_var = tk.StringVar(value="grok")
+        self.chat_label_var = self._platform_panels["grok"]["label_var"]
+        self.chat_input = self._platform_panels["grok"]["input"]
+        self.send_btn = self._platform_panels["grok"]["send_btn"]
+        self.batch_btn = self._platform_panels["grok"]["batch_btn"]
+        self.attach_list_frame = self._platform_panels["grok"]["attach_list_frame"]
+        self.chat_display = self._platform_panels["grok"]["display"]
+        self.chat_status_var = self._platform_panels["grok"]["status_var"]
+        self.chat_status_lbl = self._platform_panels["grok"]["status_lbl"]
+
+        # Pending attachments are shared (user chooses target platform via active tab)
+        self.pending_attachments: list[Path] = []
         self._refresh_attachment_bar()
 
-        # Input row
+    def _build_platform_chat_panel(self, parent, pk: str, accent: str):
+        """Build one platform's chat panel (Recent chats sidebar + chat area)."""
+        # Main horizontal split: sidebar (recent chats) + chat area
+        main_split = ttk.Frame(parent)
+        main_split.pack(fill="both", expand=True)
+
+        # ── LEFT: Recent Chats sidebar ──────────────────────────────────
+        sidebar = ttk.LabelFrame(main_split, text="Recent Chats", padding=4)
+        sidebar.pack(side="left", fill="y", padx=(0, 6), pady=0)
+        sidebar.configure(width=200)
+        sidebar.pack_propagate(False)
+
+        recent_listbox = tk.Listbox(sidebar, width=24, font=("Segoe UI", 9),
+                                     background="#16213e", foreground="#c1c2c5",
+                                     selectbackground=accent, selectforeground="#fff",
+                                     relief="flat", bd=0, activestyle="none",
+                                     highlightthickness=0)
+        recent_scroll = ttk.Scrollbar(sidebar, command=recent_listbox.yview)
+        recent_listbox.configure(yscrollcommand=recent_scroll.set)
+        recent_scroll.pack(side="right", fill="y")
+        recent_listbox.pack(side="left", fill="both", expand=True)
+
+        btn_row = ttk.Frame(sidebar)
+        btn_row.pack(fill="x", pady=(4, 0))
+        refresh_btn = ttk.Button(btn_row, text="🔄 Refresh",
+                                  command=lambda: self._fetch_recent_chats(pk, recent_listbox))
+        refresh_btn.pack(side="left", fill="x", expand=True, padx=(0, 2))
+
+        recent_listbox.bind("<<ListboxSelect>>",
+                            lambda e, lb=recent_listbox, p=pk: self._on_recent_chat_select(e, lb, p))
+
+        # ── RIGHT: Chat area ────────────────────────────────────────────
+        right = ttk.Frame(main_split)
+        right.pack(side="left", fill="both", expand=True)
+
+        # Controls row
+        ctrl = ttk.Frame(right)
+        ctrl.pack(fill="x", pady=(0, 4))
+
+        ttk.Label(ctrl, text="Label:").pack(side="left", padx=(0, 4))
+        label_var = tk.StringVar(value="default")
+        ttk.Entry(ctrl, textvariable=label_var, width=12).pack(side="left", padx=(0, 8))
+
+        if pk == "grok":
+            ttk.Checkbutton(ctrl, text="Grok Imagine",
+                            variable=self.imagine_enabled_var,
+                            command=self._on_imagine_toggle).pack(side="left", padx=(0, 8))
+
+        ttk.Button(ctrl, text="New Chat",
+                   command=lambda p=pk: self._new_chat_for(p)).pack(side="right", padx=(4, 0))
+        ttk.Button(ctrl, text="Close Browser",
+                   command=lambda p=pk: self._close_browser_for(p)).pack(side="right", padx=(4, 0))
+        ttk.Button(ctrl, text="Clear",
+                   command=lambda p=pk: self._clear_chat_display_for(p)).pack(side="right", padx=(4, 0))
+
+        # Status
+        status_var = tk.StringVar(value="● not started")
+        status_lbl = ttk.Label(right, textvariable=status_var,
+                                foreground="#909296", font=("Segoe UI", 9, "italic"))
+        status_lbl.pack(anchor="w", pady=(0, 4))
+
+        # Store per-platform status refs for _poll_browser_status
+        setattr(self, f"chat_status_var_{pk}", status_var)
+        setattr(self, f"chat_status_lbl_{pk}", status_lbl)
+
+        # Chat display
+        chat_frame = ttk.Frame(right)
+        chat_frame.pack(fill="both", expand=True, pady=(0, 4))
+        display = tk.Text(chat_frame, wrap="word",
+                          background="#1a1b1e", foreground="#c1c2c5",
+                          font=("Cascadia Code", 10),
+                          state="disabled", cursor="arrow",
+                          relief="flat", bd=0,
+                          selectbackground="#339af0", selectforeground="#fff",
+                          padx=10, pady=8)
+        scroll = ttk.Scrollbar(chat_frame, command=display.yview)
+        display.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        display.pack(side="left", fill="both", expand=True)
+        for tag, fg in [("user", "#58a6ff"), ("ai", "#7ee787"), ("system", "#8b949e"),
+                        ("attachment", "#d2a8ff"), ("media", "#ffa657"),
+                        ("link", "#58a6ff"), ("divider", "#444")]:
+            display.tag_config(tag, foreground=fg)
+        if tag == "link":
+            display.tag_config("link", underline=True)
+
+        # Bottom bar
+        bottom = ttk.Frame(right)
+        bottom.pack(fill="x")
+
+        att_row = ttk.Frame(bottom)
+        att_row.pack(fill="x", pady=(0, 2))
+        attach_list_frame = ttk.Frame(att_row)
+        attach_list_frame.pack(side="left", fill="x", expand=True)
+        ttk.Button(att_row, text="Media ↗",
+                   command=self._open_media_folder).pack(side="right", padx=(2, 0))
+        ttk.Button(att_row, text="Clear att",
+                   command=self._clear_attachments).pack(side="right", padx=(2, 0))
+        ttk.Button(att_row, text="+ Image",
+                   command=lambda: self._add_attachment("image")).pack(side="right", padx=(2, 0))
+        ttk.Button(att_row, text="+ File",
+                   command=lambda: self._add_attachment("any")).pack(side="right", padx=(2, 0))
+
         input_frame = ttk.Frame(bottom)
         input_frame.pack(fill="x", pady=(2, 0))
-        self.chat_input = ttk.Entry(input_frame)
-        self.chat_input.pack(side="left", fill="x", expand=True, padx=(0, 4))
-        self.chat_input.bind("<Return>", lambda e: self._send_chat())
-        self.send_btn = ttk.Button(input_frame, text="Send", style="Accent.TButton",
-                                    command=self._send_chat)
-        self.send_btn.pack(side="left", padx=(0, 4))
-        self.batch_btn = ttk.Button(input_frame, text="Batch ZIP", command=self._batch_zip)
-        self.batch_btn.pack(side="left")
+        chat_input = ttk.Entry(input_frame)
+        chat_input.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        send_btn = ttk.Button(input_frame, text="Send", style="Accent.TButton",
+                               command=lambda p=pk: self._send_chat_for(p))
+        send_btn.pack(side="left", padx=(0, 4))
+        batch_btn = ttk.Button(input_frame, text="Batch ZIP",
+                                command=self._batch_zip)
+        batch_btn.pack(side="left")
 
-    # ---- Chat session controls ----
-    def _ensure_bridge(self):
-        """Create the bridge worker on demand, or update its headless/CDP setting."""
+        chat_input.bind("<Return>", lambda e, p=pk: self._send_chat_for(p))
+
+        # Store panel refs
+        self._platform_panels[pk] = {
+            "display": display,
+            "input": chat_input,
+            "send_btn": send_btn,
+            "batch_btn": batch_btn,
+            "label_var": label_var,
+            "status_var": status_var,
+            "status_lbl": status_lbl,
+            "attach_list_frame": attach_list_frame,
+            "recent_listbox": recent_listbox,
+            "_recent_data": [],      # list of {"id":..., "title":...}
+        }
+
+        # Kick off initial recent-chats fetch (non-blocking)
+        self.root.after(2000, lambda: self._fetch_recent_chats(pk, recent_listbox))
+
+    # ---- Recent chats ------------------------------------------------
+    def _fetch_recent_chats(self, pk: str, listbox: tk.Listbox):
+        """Fetch recent conversations from the platform's web API using saved session cookies."""
+        listbox.delete(0, "end")
+        listbox.insert("end", "⏳ Loading...")
+        panel = self._platform_panels.get(pk, {})
+
+        def worker():
+            try:
+                import json as _json
+                import http.cookiejar
+                import urllib.request
+
+                session_file = SESSIONS_DIR / f"{pk}_default.json"
+                if not session_file.exists():
+                    label = panel.get("label_var", tk.StringVar()).get().strip() or "default"
+                    session_file = SESSIONS_DIR / f"{pk}_{label}.json"
+                if not session_file.exists():
+                    self.root.after(0, self._set_recent_error, pk, listbox, "No session file found")
+                    return
+
+                raw = _json.loads(session_file.read_text("utf-8"))
+                cookies_list = raw.get("cookies", [])
+
+                jar = http.cookiejar.CookieJar()
+
+                class _FakeCookie:
+                    def __init__(self, c):
+                        self.name = c["name"]
+                        self.value = c["value"]
+                        self.domain = c.get("domain", "")
+                        self.path = c.get("path", "/")
+                        self.secure = c.get("secure", False)
+                        self.expires = int(c.get("expires", -1)) if c.get("expires", -1) != -1 else None
+                        self.has_nonstandard_attr = lambda *a: False
+                        self.is_expired = lambda: False
+                        self.discard = False
+                        self.comment = None
+                        self.comment_url = None
+                        self.rfc2109 = False
+                        self.port = None
+                        self.port_specified = False
+                        self.domain_specified = True
+                        self.domain_initial_dot = self.domain.startswith(".")
+                        self.path_specified = True
+                        self._rest = {}
+
+                for c in cookies_list:
+                    jar._cookies.setdefault(c.get("domain", ""), {}).setdefault(
+                        c.get("path", "/"), {})[c["name"]] = _FakeCookie(c)
+
+                # Build cookie header manually
+                cookie_header = "; ".join(
+                    f"{c['name']}={c['value']}" for c in cookies_list
+                    if c.get("value")
+                )
+
+                if pk == "chatgpt":
+                    url = "https://chatgpt.com/backend-api/conversations?offset=0&limit=28&order=updated"
+                    req = urllib.request.Request(url, headers={
+                        "Cookie": cookie_header,
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                        "Referer": "https://chatgpt.com/",
+                    })
+                    with urllib.request.urlopen(req, timeout=10) as resp:
+                        data = _json.loads(resp.read())
+                    items = data.get("items", [])
+                    chats = [{"id": it["id"], "title": it.get("title", "Untitled")} for it in items]
+
+                elif pk == "grok":
+                    url = "https://grok.com/rest/app-chat/conversations?pageSize=28"
+                    req = urllib.request.Request(url, headers={
+                        "Cookie": cookie_header,
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                        "Referer": "https://grok.com/",
+                        "Content-Type": "application/json",
+                    })
+                    with urllib.request.urlopen(req, timeout=10) as resp:
+                        data = _json.loads(resp.read())
+                    convs = data.get("conversations", data.get("items", []))
+                    chats = [{"id": c.get("conversationId", c.get("id", "")),
+                              "title": c.get("title", "Untitled")} for c in convs]
+                else:
+                    chats = []
+
+                self.root.after(0, self._set_recent_chats, pk, listbox, chats)
+            except Exception as e:
+                self.root.after(0, self._set_recent_error, pk, listbox, str(e))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _set_recent_chats(self, pk: str, listbox: tk.Listbox, chats: list):
+        listbox.delete(0, "end")
+        panel = self._platform_panels.get(pk, {})
+        panel["_recent_data"] = chats
+        if not chats:
+            listbox.insert("end", "(no conversations found)")
+            return
+        for c in chats:
+            title = c["title"]
+            if len(title) > 26:
+                title = title[:24] + "…"
+            listbox.insert("end", title)
+
+    def _set_recent_error(self, pk: str, listbox: tk.Listbox, err: str):
+        listbox.delete(0, "end")
+        listbox.insert("end", f"⚠ {err[:28]}")
+        self._enqueue_log(f"[{pk}] Recent chats error: {err}")
+
+    def _on_recent_chat_select(self, event, listbox: tk.Listbox, pk: str):
+        sel = listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        panel = self._platform_panels.get(pk, {})
+        chats = panel.get("_recent_data", [])
+        if idx >= len(chats):
+            return
+        chat = chats[idx]
+        title = chat.get("title", "")
+        chat_id = chat.get("id", "")
+        self._enqueue_log(f"[{pk}] Selected recent chat: {title} (id={chat_id})")
+        # Show the URL/ID in the display
+        display = panel.get("display")
+        if display:
+            display.configure(state="normal")
+            if pk == "chatgpt":
+                url = f"https://chatgpt.com/c/{chat_id}"
+            else:
+                url = f"https://grok.com/chat/{chat_id}"
+            display.insert("end", f"\n[Recent chat loaded] {title}\n{url}\n", "system")
+            display.see("end")
+            display.configure(state="disabled")
+
+    # ---- Per-platform bridge controls ---------------------------------
+    def _ensure_bridge_for(self, pk: str):
+        """Get or create the BridgeWorker for a specific platform."""
         desired_headless = bool(self.chat_headless_var.get())
         desired_cdp = self._get_cdp_url()
-        if self._bridge is None:
+        bridge = self._bridges.get(pk)
+        if bridge is None:
             from chat_engine import BridgeWorker
-            self._bridge = BridgeWorker(SESSIONS_DIR, media_dir=MEDIA_DIR)
+            bridge = BridgeWorker(SESSIONS_DIR, media_dir=MEDIA_DIR)
             if desired_cdp:
-                self._bridge._cdp_url = desired_cdp
-            self._bridge.start(headless=desired_headless)
-            self._bridge_headless = desired_headless
-        elif self._bridge_headless != desired_headless:
-            # Toggle headless — worker stays alive, browsers will be rebuilt
-            self._enqueue_log("Switching headless mode (browser will restart)…")
+                bridge._cdp_url = desired_cdp
+            bridge.start(headless=desired_headless)
+            self._bridges[pk] = bridge
+            self._bridge_headless[pk] = desired_headless
+        elif self._bridge_headless.get(pk) != desired_headless:
             try:
-                self._bridge.set_headless(desired_headless)
+                bridge.set_headless(desired_headless)
             except Exception as e:
                 self._enqueue_log(f"⚠ set_headless failed: {e}")
-            self._bridge_headless = desired_headless
-        return self._bridge
+            self._bridge_headless[pk] = desired_headless
+        return bridge
+
+    def _new_chat_for(self, pk: str):
+        panel = self._platform_panels.get(pk, {})
+        label = panel.get("label_var", tk.StringVar()).get().strip() or "default"
+        bridge = self._bridges.get(pk)
+        if bridge is None:
+            self._enqueue_log(f"ℹ No {pk} browser yet — next message starts fresh.")
+            return
+
+        def worker():
+            try:
+                ok = bridge.start_new_chat(pk, label)
+                msg = f"✓ New {pk} chat started" if ok else f"ℹ No active {pk} browser."
+                self.root.after(0, self._enqueue_log, msg)
+                self.root.after(0, self._append_chat_divider_for, pk, f"— NEW {pk} chat —")
+            except Exception as e:
+                self.root.after(0, self._enqueue_log, f"✗ {pk} new chat failed: {e}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _close_browser_for(self, pk: str):
+        bridge = self._bridges.get(pk)
+        if bridge is None:
+            self._enqueue_log(f"ℹ {pk} browser not running.")
+            return
+
+        def worker():
+            try:
+                bridge.close_all_sessions()
+                self.root.after(0, self._enqueue_log, f"✓ {pk} browser closed.")
+                self.root.after(0, self._append_chat_divider_for, pk, f"— {pk} browser closed —")
+            except Exception as e:
+                self.root.after(0, self._enqueue_log, f"✗ {pk} close failed: {e}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _clear_chat_display_for(self, pk: str):
+        display = self._platform_panels.get(pk, {}).get("display")
+        if display:
+            display.configure(state="normal")
+            display.delete("1.0", "end")
+            display.configure(state="disabled")
+
+    def _append_chat_divider_for(self, pk: str, text: str):
+        display = self._platform_panels.get(pk, {}).get("display")
+        if display:
+            try:
+                display.configure(state="normal")
+                display.insert("end", f"\n{text}\n", "divider")
+                display.see("end")
+                display.configure(state="disabled")
+            except Exception:
+                pass
+
+    def _send_chat_for(self, pk: str):
+        """Send a message for a specific platform independently."""
+        if self._chat_busy.get(pk):
+            self._enqueue_log(f"⚠ [{pk}] Tunggu pesan sebelumnya selesai.")
+            return
+
+        panel = self._platform_panels.get(pk, {})
+        chat_input = panel.get("input")
+        send_btn = panel.get("send_btn")
+        batch_btn = panel.get("batch_btn")
+        display = panel.get("display")
+        label_var = panel.get("label_var", tk.StringVar())
+
+        msg = chat_input.get().strip()
+        attachments = list(self.pending_attachments)
+        if not msg and not attachments:
+            return
+        chat_input.delete(0, "end")
+        label = label_var.get().strip() or "default"
+        imagine_opts = self._get_imagine_opts() if pk == "grok" else None
+
+        # Show in display
+        display.configure(state="normal")
+        prefix = f"Imagine/{imagine_opts['mode']}" if imagine_opts else "You"
+        display.insert("end", f"\n[{prefix}] {msg or '(no text)'}\n", "user")
+        for p in attachments:
+            display.insert("end", f"  {_file_icon(p)} {p.name}\n", "attachment")
+        status_text = "generating..." if imagine_opts else "thinking..."
+        display.insert("end", f"[{pk}] {status_text}\n", "system")
+        display.see("end")
+        display.configure(state="disabled")
+
+        self.pending_attachments = []
+        self._refresh_attachment_bar()
+
+        self._chat_busy[pk] = True
+        if send_btn:
+            send_btn.configure(state="disabled", text="...")
+
+        if self.chat_debug_phases_var.get():
+            os.environ["DEBUG_PHASES"] = "1"
+        else:
+            os.environ.pop("DEBUG_PHASES", None)
+
+        gui = self
+
+        def worker():
+            try:
+                bridge = gui._ensure_bridge_for(pk)
+                result = bridge.chat(pk, msg, label=label, timeout=240,
+                                     attachments=attachments,
+                                     imagine_opts=imagine_opts)
+                gui.root.after(0, gui._on_chat_result_for, pk, result)
+            except Exception as e:
+                gui.root.after(0, gui._on_chat_result_for, pk,
+                               {"ok": False, "error": str(e), "platform": pk})
+            finally:
+                gui.root.after(0, gui._unlock_send_btn_for, pk)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _unlock_send_btn_for(self, pk: str):
+        self._chat_busy[pk] = False
+        panel = self._platform_panels.get(pk, {})
+        btn = panel.get("send_btn")
+        batch = panel.get("batch_btn")
+        if btn:
+            btn.configure(state="normal", text="Send")
+        if batch:
+            batch.configure(state="normal", text="Batch ZIP")
+
+    def _on_chat_result_for(self, pk: str, result: dict):
+        panel = self._platform_panels.get(pk, {})
+        display = panel.get("display")
+        if display is None:
+            return
+        display.configure(state="normal")
+        # Remove "thinking..." placeholder
+        content = display.get("1.0", "end")
+        cleaned = [l for l in content.split("\n") if "thinking..." not in l and "generating..." not in l]
+        display.delete("1.0", "end")
+        display.insert("1.0", "\n".join(cleaned))
+
+        if result.get("ok"):
+            response = result.get("response", "")
+            media = result.get("media", []) or []
+            elapsed = result.get("elapsed_ms", 0)
+            is_new = result.get("is_new_chat", False)
+            url = result.get("chat_url", "")
+            meta = f"  ({'NEW' if is_new else 'continuation'}, {elapsed/1000:.1f}s"
+            if url:
+                meta += f", {url[:55]}{'...' if len(url) > 55 else ''}"
+            meta += ")"
+            display.insert("end", f"[{pk}]{meta}\n", "system")
+            display.insert("end", f"{response}\n", "ai")
+            for m in media:
+                local = m.get("local_path", "")
+                mtype = m.get("type", "file")
+                if mtype == "image" and local and Path(local).exists():
+                    display.insert("end", f"  🖼 {Path(local).name}\n", "media")
+                    self._insert_image_thumbnail_to(display, local)
+                elif mtype == "video" and local:
+                    display.insert("end", f"  🎬 video saved → {local}\n", "media")
+                else:
+                    display.insert("end", f"  📎 {mtype}: {local}\n", "media")
+        else:
+            display.insert("end", f"[ERROR] {result.get('error', 'Unknown')}\n", "system")
+        display.see("end")
+        display.configure(state="disabled")
+
+    def _insert_image_thumbnail_to(self, display: tk.Text, path: str):
+        try:
+            ext = Path(path).suffix.lower()
+            img = None
+            if ext in (".png", ".gif"):
+                img = tk.PhotoImage(file=path)
+            elif ext in (".jpg", ".jpeg", ".webp", ".bmp"):
+                from PIL import Image, ImageTk
+                pil = Image.open(path)
+                pil.thumbnail((320, 240))
+                img = ImageTk.PhotoImage(pil)
+            if img:
+                self._chat_images.append(img)
+                display.configure(state="normal")
+                display.image_create("end", image=img)
+                display.insert("end", "\n")
+                display.configure(state="disabled")
+        except Exception as e:
+            self._enqueue_log(f"⚠ thumbnail: {e}")
+
+    # ---- Chat session controls (legacy/compat shims) ------------------
+    def _ensure_bridge(self):
+        """Legacy shim — returns Grok bridge (used by batch_zip)."""
+        return self._ensure_bridge_for("grok")
 
     def _get_cdp_url(self):
         if self.chat_cdp_var.get():
@@ -603,44 +1002,41 @@ class AIChatBridgeApp:
 
     def _on_cdp_toggle(self):
         cdp_url = self._get_cdp_url()
-        if self._bridge is not None:
-            try:
-                self._bridge.set_cdp_url(cdp_url)
-                mode = f"CDP ({cdp_url})" if cdp_url else "standard Playwright"
-                self._enqueue_log(f"Switched to {mode} — browser will restart on next send.")
-            except Exception as e:
-                self._enqueue_log(f"⚠ CDP toggle failed: {e}")
+        for pk, bridge in self._bridges.items():
+            if bridge:
+                try:
+                    bridge.set_cdp_url(cdp_url)
+                except Exception as e:
+                    self._enqueue_log(f"⚠ {pk} CDP toggle failed: {e}")
 
     def _on_headless_toggle(self):
-        # The next send will pick up the new setting via _ensure_bridge
-        if self._bridge is not None:
-            self._enqueue_log(
-                "ℹ Headless toggle will apply on next message — browser will restart."
-            )
+        self._enqueue_log("ℹ Headless toggle applies on next send for each platform.")
 
     def _on_chat_target_changed(self):
-        # No-op — sessions are keyed per (platform, label) inside the pool
         pass
 
     def _on_imagine_toggle(self):
-        """Show/hide Imagine options panel."""
+        """Show/hide Imagine options panel (Grok tab only)."""
+        grok_panel = self._platform_panels.get("grok", {})
+        display = grok_panel.get("display")
         if self.imagine_enabled_var.get():
-            self.imagine_frame.pack(fill="x", pady=(0, 4), before=self.chat_display.master)
-            # Force platform to grok when Imagine is enabled
-            self.chat_platform_var.set("grok")
+            # Show imagine frame before chat display inside grok panel
+            if display:
+                try:
+                    self.imagine_frame.pack(fill="x", pady=(0, 4),
+                                            before=display.master)
+                except Exception:
+                    self.imagine_frame.pack(fill="x", pady=(0, 4))
         else:
             self.imagine_frame.pack_forget()
 
     def _on_imagine_mode_changed(self):
-        """Show/hide video-only options based on mode selection."""
         pass  # all options are inline now
 
     def _get_imagine_opts(self) -> dict | None:
-        """Build imagine_opts dict from GUI state, or None if disabled."""
         if not self.imagine_enabled_var.get():
             return None
         aspect_raw = self.imagine_aspect_var.get()
-        # Extract ratio from "9:16 (Vertical)" → "9:16"
         aspect = aspect_raw.split(" ")[0] if " " in aspect_raw else aspect_raw
         return {
             "mode": self.imagine_mode_var.get(),
@@ -650,61 +1046,19 @@ class AIChatBridgeApp:
         }
 
     def _new_chat(self):
-        """Force a new conversation for the current target."""
-        platform = self.chat_platform_var.get()
-        label = self.chat_label_var.get().strip() or "default"
-        if self._bridge is None:
-            self._enqueue_log("ℹ No browser open yet — first message will start a fresh chat.")
-            self._append_chat_divider(f"— next message will start a NEW {platform} chat —")
-            return
-
-        bridge = self._bridge
-
-        def worker():
-            try:
-                ok = bridge.start_new_chat(platform, label)
-                msg = (f"✓ Started new {platform} chat" if ok else
-                       f"ℹ No active {platform} browser to reset — next message starts fresh.")
-                self.root.after(0, self._enqueue_log, msg)
-                self.root.after(0, self._append_chat_divider,
-                                f"— NEW {platform} chat started —")
-            except Exception as e:
-                self.root.after(0, self._enqueue_log, f"✗ New chat failed: {e}")
-
-        threading.Thread(target=worker, daemon=True).start()
+        """Legacy shim — new chat on Grok."""
+        self._new_chat_for("grok")
 
     def _close_browser(self):
-        """Close all browser sessions (frees RAM). Worker thread stays alive;
-        next message will re-launch the browser automatically."""
-        if self._bridge is None:
-            self._enqueue_log("ℹ Browser is not running.")
-            return
-        bridge = self._bridge
-
-        def worker():
-            try:
-                bridge.close_all_sessions()
-                self.root.after(0, self._enqueue_log, "✓ Browser closed. RAM freed.")
-                self.root.after(0, self._append_chat_divider, "— browser closed —")
-            except Exception as e:
-                self.root.after(0, self._enqueue_log, f"✗ Close failed: {e}")
-
-        threading.Thread(target=worker, daemon=True).start()
+        """Legacy shim — close Grok browser."""
+        self._close_browser_for("grok")
 
     def _clear_chat_display(self):
-        self.chat_display.configure(state="normal")
-        self.chat_display.delete("1.0", "end")
-        self.chat_display.configure(state="disabled")
+        self._clear_chat_display_for("grok")
         self._chat_images.clear()
 
     def _append_chat_divider(self, text: str):
-        try:
-            self.chat_display.configure(state="normal")
-            self.chat_display.insert("end", f"\n{text}\n", "divider")
-            self.chat_display.see("end")
-            self.chat_display.configure(state="disabled")
-        except Exception:
-            pass
+        self._append_chat_divider_for("grok", text)
 
     # ---- Attachment management ----
     def _add_attachment(self, kind: str):
@@ -1052,98 +1406,18 @@ class AIChatBridgeApp:
 
     # ---- Chat ----
     def _send_chat(self):
-        if self._chat_busy:
-            self._enqueue_log("⚠ Tunggu pesan sebelumnya selesai dulu.")
-            return
-        msg = self.chat_input.get().strip()
-        attachments = list(self.pending_attachments)
-        if not msg and not attachments:
-            return
-        self.chat_input.delete(0, "end")
-        platform = self.chat_platform_var.get()
-        label = self.chat_label_var.get().strip() or "default"
-        imagine_opts = self._get_imagine_opts()
-
-        # Show divider when switching between platforms
-        last_platform = getattr(self, '_last_chat_platform', None)
-        if last_platform and last_platform != platform:
-            self._append_chat_divider(f"━━ switched to {platform.upper()} ━━")
-        self._last_chat_platform = platform
-
-        self.chat_display.configure(state="normal")
-        if imagine_opts:
-            mode = imagine_opts["mode"]
-            self.chat_display.insert("end",
-                f"\n[You → Imagine/{mode}] {msg or '(no text)'}\n", "user")
-        else:
-            self.chat_display.insert("end", f"\n[You] {msg or '(no text)'}\n", "user")
-        if attachments:
-            for p in attachments:
-                self.chat_display.insert("end", f"  {_file_icon(p)} {p.name}\n", "attachment")
-        status_text = "generating..." if imagine_opts else "thinking..."
-        self.chat_display.insert("end", f"[{platform}] {status_text}\n", "system")
-        self.chat_display.see("end")
-        self.chat_display.configure(state="disabled")
-
-        self.pending_attachments = []
-        self._refresh_attachment_bar()
-
-        # Lock send button
-        self._chat_busy = True
-        self.send_btn.configure(state="disabled", text="...")
-
-        gui = self
-
-        class _GuiHandler(logging.Handler):
-            def emit(self, record):
-                try:
-                    if record.name != "chat_engine":
-                        return
-                    msg_text = record.getMessage()
-                    if ("phase=" not in msg_text and "Debug artifacts" not in msg_text
-                        and "Extracted" not in msg_text and "Attached" not in msg_text
-                        and "Starting NEW" not in msg_text
-                        and "grok-imagine" not in msg_text):
-                        return
-                    gui.root.after(0, gui._append_chat_status, msg_text)
-                except Exception:
-                    pass
-
-        handler = _GuiHandler(level=logging.INFO)
-        logging.getLogger("chat_engine").addHandler(handler)
-
-        if self.chat_debug_phases_var.get():
-            os.environ["DEBUG_PHASES"] = "1"
-        else:
-            os.environ.pop("DEBUG_PHASES", None)
-
-        def worker():
-            try:
-                bridge = self._ensure_bridge()
-                result = bridge.chat(platform, msg, label=label, timeout=240,
-                                     attachments=attachments,
-                                     imagine_opts=imagine_opts)
-                # Do NOT close — worker thread persists across sends!
-                self.root.after(0, self._on_chat_result, result, platform)
-            except Exception as e:
-                self.root.after(0, self._on_chat_result,
-                               {"ok": False, "error": str(e), "platform": platform}, platform)
-            finally:
-                logging.getLogger("chat_engine").removeHandler(handler)
-                self.root.after(0, self._unlock_send_button)
-
-        threading.Thread(target=worker, daemon=True).start()
+        """Legacy shim — sends on Grok (used by batch_zip hotkey, etc.)."""
+        self._send_chat_for("grok")
 
     def _unlock_send_button(self):
-        self._chat_busy = False
-        self.send_btn.configure(state="normal", text="Send")
-        self.batch_btn.configure(state="normal", text="📦 Batch ZIP")
+        """Legacy shim — unlock Grok send button."""
+        self._unlock_send_btn_for("grok")
 
     # ---- Batch ZIP processing ----
     def _batch_zip(self):
         """Open a ZIP file containing Scene_1/, Scene_2/... folders,
         each with image.png + prompt.txt. Process them sequentially."""
-        if self._chat_busy:
+        if self._chat_busy.get("grok"):
             self._enqueue_log("⚠ Tunggu proses sebelumnya selesai dulu.")
             return
 
@@ -1238,7 +1512,7 @@ class AIChatBridgeApp:
         self.chat_platform_var.set("grok")
 
         # Lock UI
-        self._chat_busy = True
+        self._chat_busy["grok"] = True
         self.send_btn.configure(state="disabled")
         self.batch_btn.configure(state="disabled", text="⏳ Batch...")
 
@@ -1306,78 +1580,26 @@ class AIChatBridgeApp:
         threading.Thread(target=batch_worker, daemon=True).start()
 
     def _append_chat_status(self, text: str):
-        try:
-            self.chat_display.configure(state="normal")
-            self.chat_display.insert("end", f"  · {text}\n", "system")
-            self.chat_display.see("end")
-            self.chat_display.configure(state="disabled")
-        except Exception:
-            pass
+        """Legacy shim — appends status to Grok display."""
+        display = self._platform_panels.get("grok", {}).get("display")
+        if display:
+            try:
+                display.configure(state="normal")
+                display.insert("end", f"  · {text}\n", "system")
+                display.see("end")
+                display.configure(state="disabled")
+            except Exception:
+                pass
 
     def _on_chat_result(self, result, platform):
-        self.chat_display.configure(state="normal")
-        content = self.chat_display.get("1.0", "end")
-        lines = content.split("\n")
-        cleaned = [l for l in lines if "thinking..." not in l and "generating..." not in l]
-        self.chat_display.delete("1.0", "end")
-        self.chat_display.insert("1.0", "\n".join(cleaned))
-
-        if result.get("ok"):
-            response = result.get("response", "")
-            media = result.get("media", []) or []
-            elapsed = result.get("elapsed_ms", 0)
-            is_new = result.get("is_new_chat", False)
-            url = result.get("chat_url", "")
-
-            # Show meta info
-            meta = f"  ({'NEW chat' if is_new else 'continuation'}, {elapsed/1000:.1f}s"
-            if url:
-                meta += f", {url[:60]}{'...' if len(url) > 60 else ''}"
-            meta += ")"
-            self.chat_display.insert("end", f"[{platform}]{meta}\n", "system")
-            self.chat_display.insert("end", f"{response}\n", "ai")
-
-            for m in media:
-                local = m.get("local_path", "")
-                mtype = m.get("type", "file")
-                if mtype == "image" and local and Path(local).exists():
-                    self.chat_display.insert("end", f"  🖼 {Path(local).name}\n", "media")
-                    self._insert_image_thumbnail(local)
-                elif mtype == "video" and local:
-                    self.chat_display.insert("end", f"  🎬 video saved → {local}\n", "media")
-                else:
-                    self.chat_display.insert("end", f"  📎 {mtype}: {local}\n", "media")
-        else:
-            self.chat_display.insert("end", f"[ERROR] {result.get('error', 'Unknown')}\n", "system")
-        self.chat_display.see("end")
-        self.chat_display.configure(state="disabled")
+        """Legacy shim — routes to per-platform result handler."""
+        self._on_chat_result_for(platform, result)
 
     def _insert_image_thumbnail(self, path: str):
-        try:
-            ext = Path(path).suffix.lower()
-            img = None
-            if ext in (".png", ".gif"):
-                img = tk.PhotoImage(file=path)
-                w = img.width()
-                if w > 400:
-                    factor = max(2, w // 400)
-                    img = img.subsample(factor, factor)
-            else:
-                try:
-                    from PIL import Image, ImageTk
-                    pil_img = Image.open(path)
-                    pil_img.thumbnail((400, 400))
-                    img = ImageTk.PhotoImage(pil_img)
-                except Exception:
-                    self.chat_display.insert(
-                        "end", f"     (preview: install Pillow for {ext} thumbnails)\n",
-                        "system")
-                    return
-            self._chat_images.append(img)
-            self.chat_display.image_create("end", image=img)
-            self.chat_display.insert("end", "\n")
-        except Exception as e:
-            self.chat_display.insert("end", f"     (preview failed: {e})\n", "system")
+        """Legacy shim — inserts thumbnail to Grok display."""
+        display = self._platform_panels.get("grok", {}).get("display")
+        if display:
+            self._insert_image_thumbnail_to(display, path)
 
     # ---- API Server ----
     def _start_api_server(self):
