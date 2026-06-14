@@ -234,6 +234,7 @@ class ChatSession:
         return {
             "chatgpt": "https://chatgpt.com/",
             "grok": "https://grok.com/",
+            "aistudio": "https://ai.studio/apps/322b7da4-0861-4ffc-83e1-6e62054bdba1?fullscreenApplet=true",
         }.get(self.platform, "")
 
     def _goto_home(self):
@@ -629,6 +630,8 @@ class ChatSession:
                 result = self._imagine_grok(message, timeout, imagine_opts, resolved)
             elif self.platform == "chatgpt":
                 result = self._chat_chatgpt(message, timeout, resolved)
+            elif self.platform == "aistudio":
+                result = self._chat_aistudio(message, timeout, resolved)
             elif self.platform == "grok":
                 result = self._chat_grok(message, timeout, resolved)
             else:
@@ -1048,8 +1051,11 @@ class ChatSession:
                         pass
                     break
 
-            # Fallback: text stable for 3 polls (~3s)
-            if text_stable_ticks >= 3 and (last_text or has_images):
+            # Fallback: text stable for several polls AND not streaming.
+            # Raised from 3 to 5 and gated on streaming-off so long JSON
+            # replies are never read half-finished (old cut-off bug).
+            if (text_stable_ticks >= 5 and (last_text or has_images)
+                    and not self._is_chatgpt_streaming()):
                 break
 
         # For image-only responses, set a placeholder text if empty
@@ -1354,6 +1360,143 @@ class ChatSession:
                             logger.debug(f"[chatgpt] img screenshot failed: {e}")
                 except Exception as e:
                     logger.warning(f"[chatgpt] Screenshot fallback failed: {e}")
+
+        return {"text": last_text, "media": media}
+
+    # ------------------------------------------------------------------
+    # AI Studio (Fakefluencer applet) — generic web-app automation
+    # ------------------------------------------------------------------
+
+    def _is_aistudio_streaming(self) -> bool:
+        """Best-effort 'still generating' signal for the AI Studio applet.
+
+        We look for a visible Stop button, a disabled Send button, or a
+        spinner/loading element. If none of these are reliable on the page,
+        the caller falls back to text-stability detection.
+        """
+        page = self._page
+        try:
+            for sel in ('button[aria-label*="Stop" i]',
+                        'button:has-text("Stop")',
+                        '[role="progressbar"]',
+                        '.loading, .spinner, [aria-busy="true"]'):
+                el = page.query_selector(sel)
+                if el and el.is_visible():
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _chat_aistudio(self, message: str, timeout: int,
+                       attachments: list[Path]) -> dict:
+        """Drive the AI Studio applet like a human: attach (if any), type,
+        send, then wait for the reply to FULLY settle before returning.
+
+        This deliberately mirrors the robust completion logic used for
+        ChatGPT so the storyboard JSON is never read half-finished.
+        """
+        page = self._page
+        # The applet is a custom React UI. Its prompt box is a textarea or a
+        # contenteditable div; try the common shapes in order.
+        input_sel = ('textarea, div[contenteditable="true"], '
+                     'input[type="text"][placeholder]')
+        page.wait_for_selector(input_sel, timeout=20_000)
+        page.wait_for_timeout(800)
+
+        if attachments:
+            try:
+                self._attach_files(attachments)
+                logger.info(f"[aistudio] phase=attached count={len(attachments)}")
+            except Exception as e:
+                logger.warning(f"[aistudio] attach failed (continuing): {e}")
+
+        # Snapshot existing text so we can detect the NEW reply only.
+        def _page_text() -> str:
+            try:
+                return (page.inner_text("body") or "").strip()
+            except Exception:
+                return ""
+        before_text = _page_text()
+
+        input_el = page.query_selector(input_sel)
+        if not input_el:
+            raise RuntimeError("AI Studio: prompt input not found.")
+        input_el.click()
+        page.wait_for_timeout(200)
+        try:
+            page.keyboard.press("Control+a")
+            page.keyboard.press("Delete")
+        except Exception:
+            pass
+        page.wait_for_timeout(150)
+        page.keyboard.type(message, delay=8)
+        page.wait_for_timeout(300)
+
+        # Send: prefer a real Send button; fall back to Enter ONCE.
+        sent = False
+        for sel in ('button[aria-label*="Send" i]',
+                    'button:has-text("Send")',
+                    'button[type="submit"]'):
+            btn = page.query_selector(sel)
+            if btn and btn.is_enabled() and btn.is_visible():
+                btn.click()
+                sent = True
+                break
+        if not sent:
+            page.keyboard.press("Enter")
+
+        # ---- Wait for the reply to settle ----
+        # Strategy: wait until (a) new text has appeared, AND (b) it stops
+        # changing for several consecutive polls AND streaming flag is off.
+        # We NEVER press Enter again here — that was the old bug that cut
+        # replies short and produced broken JSON.
+        page.wait_for_timeout(1500)
+        deadline = time.time() + timeout
+        last_text = ""
+        stable_ticks = 0
+        new_seen = False
+
+        while time.time() < deadline:
+            page.wait_for_timeout(1000)
+            now = _page_text()
+            # The "reply" is whatever got appended after our prompt.
+            delta = now[len(before_text):] if now.startswith(before_text) else now
+            delta = delta.strip()
+
+            if delta and delta != before_text:
+                new_seen = True
+
+            if delta == last_text:
+                stable_ticks += 1
+            else:
+                stable_ticks = 0
+                last_text = delta
+
+            streaming = self._is_aistudio_streaming()
+
+            # Done when: we have new text, it's been stable a few polls,
+            # and nothing indicates it's still generating.
+            if new_seen and last_text and stable_ticks >= 3 and not streaming:
+                break
+            # Hard stable fallback even if a streaming signal never appeared.
+            if new_seen and last_text and stable_ticks >= 6:
+                break
+
+        if not last_text:
+            debug = self._save_debug_artifacts(tag="aistudio_no_response")
+            logger.error(f"[aistudio] No response. Debug: {debug}. URL: {self.current_url()}")
+            raise TimeoutError("No response received from AI Studio within timeout")
+
+        # Extract any media that rendered (images the applet produced).
+        media: list[dict] = []
+        try:
+            srcs = page.eval_on_selector_all(
+                "img",
+                "els => els.map(e => e.src).filter(s => s && s.startsWith('http'))")
+            for s in (srcs or [])[:12]:
+                media.append({"type": "image", "url": s})
+        except Exception:
+            pass
 
         return {"text": last_text, "media": media}
 

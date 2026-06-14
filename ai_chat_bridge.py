@@ -486,6 +486,40 @@ class AIChatBridgeApp:
         ttk.Spinbox(opt, from_=1, to=10, textvariable=self.gen_scenes_var,
                     width=5).grid(row=0, column=3, sticky="w", padx=4, pady=3)
 
+        # ── Provider pemilih: ChatGPT atau AI Studio ──
+        ttk.Label(opt, text="Provider skrip:").grid(row=4, column=0, sticky="w", padx=4, pady=3)
+        self._gen_provider_keys = ["chatgpt", "aistudio"]
+        self._gen_provider_labels = {"chatgpt": "ChatGPT", "aistudio": "AI Studio (Fakefluencer)"}
+        self.gen_provider_var = tk.StringVar(value="ChatGPT")
+        self.gen_provider_combo = ttk.Combobox(
+            opt, textvariable=self.gen_provider_var,
+            values=[self._gen_provider_labels[k] for k in self._gen_provider_keys],
+            width=24, state="readonly")
+        self.gen_provider_combo.current(0)
+        self.gen_provider_combo.grid(row=4, column=1, sticky="w", padx=4, pady=3)
+        ttk.Label(opt, text="(pakai AI Studio bila kuota ChatGPT habis)",
+                  style="Dim.TLabel").grid(row=4, column=2, columnspan=2,
+                                           sticky="w", padx=4, pady=3)
+
+        # ── Opsi VIDEO (dipakai saat batch ke Grok Imagine) ──
+        ttk.Label(opt, text="Durasi video:").grid(row=5, column=0, sticky="w", padx=4, pady=3)
+        self.gen_vdur_var = tk.StringVar(value="6s")
+        ttk.Combobox(opt, textvariable=self.gen_vdur_var,
+                     values=["6s", "10s"], width=8,
+                     state="readonly").grid(row=5, column=1, sticky="w", padx=4, pady=3)
+
+        ttk.Label(opt, text="Resolusi video:").grid(row=5, column=2, sticky="w", padx=4, pady=3)
+        self.gen_vres_var = tk.StringVar(value="720p")
+        ttk.Combobox(opt, textvariable=self.gen_vres_var,
+                     values=["480p (Speed)", "720p (Quality)"], width=14,
+                     state="readonly").grid(row=5, column=3, sticky="w", padx=4, pady=3)
+
+        ttk.Label(opt, text="Provider video:").grid(row=6, column=0, sticky="w", padx=4, pady=3)
+        self.gen_vprov_var = tk.StringVar(value="Grok Imagine")
+        ttk.Combobox(opt, textvariable=self.gen_vprov_var,
+                     values=["Grok Imagine"], width=14,
+                     state="readonly").grid(row=6, column=1, sticky="w", padx=4, pady=3)
+
         ttk.Label(opt, text="Format gambar:").grid(row=1, column=0, sticky="w", padx=4, pady=3)
         self.gen_aspect_var = tk.StringVar(value="9:16")
         ttk.Combobox(opt, textvariable=self.gen_aspect_var,
@@ -614,9 +648,20 @@ class AIChatBridgeApp:
         except ValueError:
             num_scenes = 2
 
+        # Map the chosen provider label back to its key
+        try:
+            prov_idx = self.gen_provider_combo.current()
+            provider = self._gen_provider_keys[prov_idx if prov_idx >= 0 else 0]
+        except Exception:
+            provider = "chatgpt"
+
         params = {
             "mode": mode,
             "num_scenes": num_scenes,
+            "provider": provider,
+            # Video options applied when batching to Grok Imagine
+            "video_duration": "10s" if self.gen_vdur_var.get().startswith("10") else "6s",
+            "video_resolution": "480p" if self.gen_vres_var.get().startswith("480") else "720p",
             "project_name": self.gen_project_var.get().strip() or "Project",
             "aspect": self.gen_aspect_var.get(),
             "voice_key": self._gen_voice_keys[self.gen_voice_combo.current()],
@@ -647,16 +692,32 @@ class AIChatBridgeApp:
             )
             self._gen_log_msg("📝 Mengirim brief ke ChatGPT...")
 
-            bridge = self._ensure_bridge_for("chatgpt")
-            try:
-                bridge.start_new_chat("chatgpt", label)
-            except Exception:
-                pass
+            # Collect reference photos to actually SHOW the AI (model + product),
+            # so the generated script matches the uploaded assets.
+            ref_imgs: list = []
+            needs = ffgen.MODES[params["mode"]]["needs"]
+            if "model" in needs:
+                ref_imgs += list(params.get("model_imgs") or [])
+            if "product" in needs:
+                ref_imgs += list(params.get("product_imgs") or [])
+            # De-dup while keeping order; cap to a sane number for upload speed.
+            seen = set()
+            ref_imgs = [p for p in ref_imgs if not (p in seen or seen.add(p))][:6]
 
-            result = bridge.chat("chatgpt", prompt, label=label,
-                                 timeout=180, force_new_chat=True)
+            provider = params.get("provider", "chatgpt")
+            bridge = self._ensure_bridge_for(provider)
+            # Note: bridge.chat(..., force_new_chat=True) already resets the
+            # conversation, so we don't pre-call start_new_chat (avoids a
+            # redundant double navigation, especially on AI Studio).
+
+            if ref_imgs:
+                self._gen_log_msg(f"🖼  Melampirkan {len(ref_imgs)} foto referensi ke {provider}...")
+
+            result = bridge.chat(provider, prompt, label=label,
+                                 timeout=180, force_new_chat=True,
+                                 attachments=ref_imgs)
             if not result.get("ok"):
-                self._gen_log_msg(f"✗ ChatGPT gagal: {result.get('error', '?')}")
+                self._gen_log_msg(f"✗ {provider} gagal: {result.get('error', '?')}")
                 return
 
             reply = result.get("response", "") or result.get("text", "") or ""
@@ -706,7 +767,9 @@ class AIChatBridgeApp:
             # 4) Auto-chain into Grok batch video
             self._gen_log_msg("⚡ Lanjut ke Grok Imagine (batch video)...")
             self.root.after(0, lambda: self._gen_run_grok_batch(
-                zip_path, params["aspect"]))
+                zip_path, params["aspect"],
+                params.get("video_duration", "6s"),
+                params.get("video_resolution", "720p")))
 
         except Exception as e:
             self._gen_log_msg(f"✗ Error: {e}")
@@ -714,17 +777,22 @@ class AIChatBridgeApp:
             if not params.get("autochain"):
                 self.root.after(0, self._gen_unlock)
 
-    def _gen_run_grok_batch(self, zip_path: Path, aspect: str):
+    def _gen_run_grok_batch(self, zip_path: Path, aspect: str,
+                            duration: str = "6s", resolution: str = "720p"):
         """Feed the freshly-built zip into the existing Grok batch pipeline."""
         try:
-            # Configure Imagine for video + chosen aspect, then run batch.
+            # Configure Imagine for video + chosen aspect/duration/resolution.
             self.imagine_enabled_var.set(True)
             self._on_imagine_toggle()
             self.imagine_mode_var.set("video")
             self._on_imagine_mode_changed()
             self.imagine_aspect_var.set(aspect)
+            self.imagine_dur_var.set(duration)
+            self.imagine_res_var.set(resolution)
             self.chat_platform_var.set("grok")
-            self._gen_log_msg("→ Memakai pipeline Batch ZIP yang sudah ada di tab Chat.")
+            self._gen_log_msg(
+                f"→ Video: durasi {duration}, resolusi {resolution}. "
+                "Memakai pipeline Batch ZIP di tab Chat.")
             self._batch_zip_from_path(zip_path)
         except Exception as e:
             self._gen_log_msg(f"✗ Gagal mulai batch Grok: {e}")
@@ -782,7 +850,19 @@ class AIChatBridgeApp:
                         variable=self.imagine_res_var, value="480p").pack(side="left", padx=(0, 2))
         ttk.Radiobutton(self.imagine_opts_frame, text="Quality",
                         variable=self.imagine_res_var, value="720p").pack(side="left", padx=(0, 10))
+        # ---- Duration (video only) — visible inline again ----
         self.imagine_dur_var = tk.StringVar(value="6s")
+        self.imagine_dur_label = ttk.Label(self.imagine_opts_frame, text="Durasi:")
+        self.imagine_dur_label.pack(side="left", padx=(0, 4))
+        self.imagine_dur_6 = ttk.Radiobutton(
+            self.imagine_opts_frame, text="6s",
+            variable=self.imagine_dur_var, value="6s")
+        self.imagine_dur_6.pack(side="left", padx=(0, 2))
+        self.imagine_dur_10 = ttk.Radiobutton(
+            self.imagine_opts_frame, text="10s",
+            variable=self.imagine_dur_var, value="10s")
+        self.imagine_dur_10.pack(side="left", padx=(0, 10))
+        # Legacy frame holders kept for compatibility (no longer used for layout)
         self.imagine_quality_row = ttk.Frame(self.imagine_opts_frame)
         self.imagine_video_row = ttk.Frame(self.imagine_opts_frame)
         self._on_imagine_mode_changed()
@@ -1420,7 +1500,24 @@ class AIChatBridgeApp:
             self.imagine_frame.pack_forget()
 
     def _on_imagine_mode_changed(self):
-        pass  # all options are inline now
+        """Show duration only for video mode; hide it for image mode."""
+        # Guard: widgets may not exist yet during early init
+        if not hasattr(self, "imagine_dur_label"):
+            return
+        try:
+            is_video = self.imagine_mode_var.get() == "video"
+        except Exception:
+            is_video = False
+        widgets = (self.imagine_dur_label, self.imagine_dur_6, self.imagine_dur_10)
+        if is_video:
+            # Re-pack in order if currently hidden
+            for w in widgets:
+                if not w.winfo_ismapped():
+                    w.pack(side="left", padx=(0, 4))
+        else:
+            for w in widgets:
+                if w.winfo_ismapped():
+                    w.pack_forget()
 
     def _get_imagine_opts(self) -> dict | None:
         if not self.imagine_enabled_var.get():
