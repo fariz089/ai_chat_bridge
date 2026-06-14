@@ -259,6 +259,247 @@ class ChatSession:
         self._has_active_chat = False
         self.message_count = 0
 
+    def navigate_to_chat(self, url: str) -> list[dict]:
+        """Navigate the browser to a specific chat URL and scrape existing messages.
+
+        Returns a list of {"role": "user"|"assistant", "text": str} dicts.
+        """
+        if not self._ready:
+            raise RuntimeError("Session not started")
+        logger.info(f"[{self.platform}] Navigating to chat: {url}")
+        try:
+            self._page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            self._page.wait_for_timeout(2500)
+        except Exception as e:
+            logger.warning(f"[{self.platform}] Navigation warning: {e}")
+        self._has_active_chat = True
+
+        # ── DEBUG: log first few class names around user bubbles ──────────
+        if self.platform == "grok":
+            try:
+                debug_info = self._page.evaluate("""() => {
+                    // Find elements that are siblings/neighbors of .response-content-markdown
+                    // and log their class names so we can identify user bubble classes
+                    const aEl = document.querySelector('.response-content-markdown');
+                    if (!aEl) return 'no .response-content-markdown found';
+
+                    // Walk up 6 levels and dump class names + siblings
+                    const info = [];
+                    let el = aEl;
+                    for (let i = 0; i < 8; i++) {
+                        const p = el.parentElement;
+                        if (!p) break;
+                        const siblings = Array.from(p.children).map(c =>
+                            c.className.toString().substring(0, 80)
+                        );
+                        info.push('level ' + i + ': parent.class=' +
+                            p.className.toString().substring(0, 60) +
+                            ' | siblings: ' + siblings.join(' // '));
+                        el = p;
+                    }
+                    return info.join('\\n');
+                }""")
+                logger.info(f"[grok] DOM debug:\n{debug_info}")
+            except Exception as e:
+                logger.warning(f"[grok] DOM debug failed: {e}")
+
+        messages = []
+        try:
+            if self.platform == "grok":
+                messages = self._scrape_grok_history()
+            elif self.platform == "chatgpt":
+                messages = self._scrape_chatgpt_history()
+        except Exception as e:
+            logger.warning(f"[{self.platform}] History scrape failed: {e}")
+        return messages
+
+    def _scrape_grok_history(self) -> list[dict]:
+        """Scrape all messages from the current Grok chat page.
+
+        Uses layout position to discriminate roles:
+        - User messages are right-aligned (centerX > 60% of viewport width)
+        - Assistant messages are left-aligned / centered (contain .response-content-markdown)
+
+        This is layout-based so it works regardless of Grok's class names.
+        """
+        page = self._page
+        messages = []
+        try:
+            page.wait_for_timeout(1000)
+
+            result = page.evaluate("""() => {
+                const vw = window.innerWidth;
+                const results = [];
+                const seenTexts = new Set();
+
+                // ── Collect ALL text-bearing leaf containers ──────────────────
+                // Walk every element, skip invisible, skip tiny, collect text nodes
+                // that are clearly "message bubbles" (have meaningful text, not
+                // navigation/buttons/suggestions).
+
+                // ── Strategy A: use .response-content-markdown as anchor for ASSISTANT
+                //    and find user bubbles by right-alignment ──────────────────
+
+                // 1. Gather all assistant blocks
+                const aBlocks = Array.from(
+                    document.querySelectorAll('.response-content-markdown')
+                ).map(el => {
+                    const r = el.getBoundingClientRect();
+                    return {
+                        role: 'assistant',
+                        text: (el.innerText || '').trim(),
+                        top: r.top + window.scrollY,
+                        el: el
+                    };
+                }).filter(m => m.text.length > 0);
+
+                // 2. Gather user bubbles:
+                //    In Grok, user input is displayed in a rounded bubble that is
+                //    RIGHT-aligned. We find ALL text-containing divs/spans whose
+                //    bounding box center is in the right 45% of the viewport AND
+                //    that do NOT contain a .response-content-markdown inside them.
+                //    We also skip elements that are children of .response-content-markdown.
+
+                const uBlocks = [];
+                const allDivs = Array.from(document.querySelectorAll('div, p, span'));
+                allDivs.forEach(el => {
+                    // Skip if inside a .response-content-markdown
+                    if (el.closest('.response-content-markdown')) return;
+                    // Skip if it contains a .response-content-markdown
+                    if (el.querySelector('.response-content-markdown')) return;
+                    // Skip navigation, buttons, sidebar elements
+                    if (el.closest('nav, aside, header, footer, button, [role="navigation"]')) return;
+                    // Skip suggestion chips (usually short, appear below assistant msg)
+                    // They are typically in a flex row together
+                    if (el.closest('[class*="suggest"], [class*="follow"], [class*="chip"]')) return;
+
+                    const text = (el.innerText || '').trim();
+                    if (!text || text.length < 3) return;
+
+                    // Must be a "leaf-ish" node — not have too many child divs
+                    const childDivs = el.querySelectorAll('div').length;
+                    if (childDivs > 8) return;
+
+                    const r = el.getBoundingClientRect();
+                    if (r.width < 20 || r.height < 10) return;
+
+                    // Check if right-aligned: center X > 60% of viewport
+                    const centerX = r.left + r.width / 2;
+                    if (centerX < vw * 0.55) return;
+
+                    uBlocks.push({
+                        role: 'user',
+                        text: text,
+                        top: r.top + window.scrollY,
+                        el: el
+                    });
+                });
+
+                // 3. Deduplicate user blocks by text (keep shallowest/earliest)
+                const seenUser = new Set();
+                const uUnique = [];
+                // Sort by DOM depth (shallower = better) then by top
+                uBlocks.sort((a, b) => {
+                    const depthA = a.el.querySelectorAll('*').length;
+                    const depthB = b.el.querySelectorAll('*').length;
+                    if (depthA !== depthB) return depthA - depthB;
+                    return a.top - b.top;
+                });
+                uBlocks.forEach(m => {
+                    const key = m.text.substring(0, 100);
+                    if (!seenUser.has(key)) {
+                        seenUser.add(key);
+                        uUnique.push(m);
+                    }
+                });
+
+                // 4. Merge and sort by vertical position
+                const all = [...aBlocks, ...uUnique];
+                all.sort((a, b) => a.top - b.top);
+
+                // 5. Final dedup pass (in case a user text appears inside asst text)
+                const finalSeen = new Set();
+                const final = [];
+                all.forEach(m => {
+                    const key = m.role + '|' + m.text.substring(0, 100);
+                    if (!finalSeen.has(key)) {
+                        finalSeen.add(key);
+                        final.push({role: m.role, text: m.text});
+                    }
+                });
+
+                return final;
+            }""")
+
+            if result:
+                messages = result
+                logger.info(f"[grok] scraped {len(messages)} messages "
+                            f"(layout-based: "
+                            f"{sum(1 for m in messages if m['role']=='user')} user, "
+                            f"{sum(1 for m in messages if m['role']=='assistant')} assistant)")
+                return messages
+
+        except Exception as e:
+            logger.warning(f"[grok] history JS eval failed: {e}")
+
+        # ── Fallback: assistant-only ──────────────────────────────────────
+        try:
+            handles = page.query_selector_all('.response-content-markdown')
+            for h in handles:
+                text = (h.inner_text() or "").strip()
+                if text:
+                    messages.append({"role": "assistant", "text": text})
+            logger.info(f"[grok] scraped {len(messages)} messages (fallback — assistant only)")
+        except Exception as e:
+            logger.warning(f"[grok] fallback scrape failed: {e}")
+
+        return messages
+
+
+    def _scrape_chatgpt_history(self) -> list[dict]:
+        """Scrape all messages from the current ChatGPT chat page."""
+        page = self._page
+        messages = []
+        try:
+            page.wait_for_timeout(1000)
+            result = page.evaluate("""() => {
+                const msgs = [];
+                // User turns
+                document.querySelectorAll('[data-message-author-role="user"]').forEach(el => {
+                    const t = (el.innerText || '').trim();
+                    if (t) msgs.push({role: 'user', text: t,
+                        top: el.getBoundingClientRect().top + window.scrollY});
+                });
+                // Assistant turns
+                document.querySelectorAll('[data-message-author-role="assistant"]').forEach(el => {
+                    const t = (el.innerText || '').trim();
+                    if (t) msgs.push({role: 'assistant', text: t,
+                        top: el.getBoundingClientRect().top + window.scrollY});
+                });
+                msgs.sort((a, b) => a.top - b.top);
+                return msgs.map(m => ({role: m.role, text: m.text}));
+            }""")
+            if result:
+                messages = result
+        except Exception as e:
+            logger.warning(f"[chatgpt] history JS eval failed: {e}")
+        logger.info(f"[chatgpt] scraped {len(messages)} messages from history")
+        return messages
+
+    def get_access_token(self) -> str:
+        """Extract the access token from the page (ChatGPT: /api/auth/session)."""
+        if self.platform == "chatgpt":
+            try:
+                result = self._page.evaluate("""async () => {
+                    const r = await fetch('/api/auth/session');
+                    const d = await r.json();
+                    return d.accessToken || '';
+                }""")
+                return result or ""
+            except Exception as e:
+                logger.warning(f"[chatgpt] get_access_token failed: {e}")
+        return ""
+
     def _wait_for_cloudflare(self, max_wait: int = 30):
         """Wait for Cloudflare Turnstile challenge to resolve (if present).
 
@@ -2052,6 +2293,20 @@ class ChatEnginePool:
         session.start_new_chat()
         return True
 
+    def navigate_to_chat(self, platform: str, url: str, label: str = "default") -> list[dict]:
+        """Navigate the platform browser to a specific chat URL and return scraped history."""
+        session = self.get_session(platform, label)
+        if session is None:
+            return []
+        return session.navigate_to_chat(url)
+
+    def get_access_token(self, platform: str, label: str = "default") -> str:
+        """Extract the access token from the logged-in browser page."""
+        session = self.get_session(platform, label, create=False)
+        if session is None:
+            return ""
+        return session.get_access_token()
+
     def list_active_sessions(self) -> list[dict]:
         """List browser sessions that are currently open."""
         out = []
@@ -2270,6 +2525,21 @@ class BridgeWorker:
         def op(pool):
             return pool.start_new_chat(platform, label)
         return self._execute(op, queue_timeout=60)
+
+    def navigate_to_chat(self, platform: str, url: str, label: str = "default") -> list[dict]:
+        """Navigate the platform browser to a specific existing chat URL.
+        Returns the scraped message history as a list of dicts."""
+        def op(pool):
+            return pool.navigate_to_chat(platform, url, label)
+        result = self._execute(op, queue_timeout=60)
+        return result if isinstance(result, list) else []
+
+    def get_access_token(self, platform: str, label: str = "default") -> str:
+        """Extract the access token from the running browser (ChatGPT only)."""
+        def op(pool):
+            return pool.get_access_token(platform, label)
+        result = self._execute(op, queue_timeout=30)
+        return result or ""
 
     def close_session(self, platform: str, label: str = "default") -> bool:
         """Close one specific browser session."""

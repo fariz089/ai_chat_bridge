@@ -29,6 +29,8 @@ from tkinter import ttk, messagebox, filedialog
 
 from platforms import PLATFORMS, CaptureResult
 
+import fakefluencer_generator as ffgen
+
 try:
     from extension_server import run_server_in_thread as run_extension_server
     EXTENSION_SERVER_IMPORT_ERROR = None
@@ -365,6 +367,10 @@ class AIChatBridgeApp:
         self.main_notebook.add(chat_tab, text="  Chat  ")
         self._build_chat_tab(chat_tab)
 
+        gen_tab = ttk.Frame(self.main_notebook, padding=12)
+        self.main_notebook.add(gen_tab, text="  🎬 Generator  ")
+        self._build_generator_tab(gen_tab)
+
         api_tab = ttk.Frame(self.main_notebook, padding=12)
         self.main_notebook.add(api_tab, text="  API Server  ")
         self._build_api_tab(api_tab)
@@ -436,6 +442,299 @@ class AIChatBridgeApp:
         self._refresh_session_info(pk, widgets)
         label_var.trace_add("write", lambda *_: self._refresh_session_info(pk, widgets))
         return widgets
+
+    # ══════════════════════════════════════════════════════════════════
+    #  GENERATOR TAB  — upload photos → ChatGPT script → zip → Grok video
+    # ══════════════════════════════════════════════════════════════════
+    def _build_generator_tab(self, parent):
+        """Full-auto pipeline UI.
+
+        User uploads model/product photos, picks mode + options, then one
+        button:  ChatGPT (script) → assemble zip → Grok Imagine (batch video).
+        """
+        self.gen_model_imgs: list[Path] = []
+        self.gen_product_imgs: list[Path] = []
+
+        # ── Mode row ────────────────────────────────────────────────
+        mode_row = ttk.Frame(parent)
+        mode_row.pack(fill="x", pady=(0, 8))
+        ttk.Label(mode_row, text="Mode:", style="Dim.TLabel").pack(side="left", padx=(0, 6))
+        self.gen_mode_var = tk.StringVar(value="ugc")
+        self._gen_mode_keys = list(ffgen.MODES.keys())
+        mode_labels = [ffgen.MODES[k]["label"] for k in self._gen_mode_keys]
+        self.gen_mode_combo = ttk.Combobox(
+            mode_row, values=mode_labels, width=22, state="readonly")
+        self.gen_mode_combo.current(0)
+        self.gen_mode_combo.pack(side="left", padx=(0, 12))
+        self.gen_mode_combo.bind(
+            "<<ComboboxSelected>>", lambda e: self._gen_on_mode_change())
+        self.gen_mode_hint = ttk.Label(mode_row, text="", style="Dim.TLabel",
+                                       font=("Segoe UI", 9, "italic"))
+        self.gen_mode_hint.pack(side="left")
+
+        # ── Options grid ────────────────────────────────────────────
+        opt = ttk.Labelframe(parent, text="  Opsi  ", padding=10)
+        opt.pack(fill="x", pady=(0, 8))
+
+        ttk.Label(opt, text="Nama project:").grid(row=0, column=0, sticky="w", padx=4, pady=3)
+        self.gen_project_var = tk.StringVar(value="Project_Baru")
+        ttk.Entry(opt, textvariable=self.gen_project_var, width=24).grid(
+            row=0, column=1, sticky="w", padx=4, pady=3)
+
+        ttk.Label(opt, text="Jumlah scene:").grid(row=0, column=2, sticky="w", padx=4, pady=3)
+        self.gen_scenes_var = tk.StringVar(value="2")
+        ttk.Spinbox(opt, from_=1, to=10, textvariable=self.gen_scenes_var,
+                    width=5).grid(row=0, column=3, sticky="w", padx=4, pady=3)
+
+        ttk.Label(opt, text="Format gambar:").grid(row=1, column=0, sticky="w", padx=4, pady=3)
+        self.gen_aspect_var = tk.StringVar(value="9:16")
+        ttk.Combobox(opt, textvariable=self.gen_aspect_var,
+                     values=list(ffgen.ASPECTS), width=8,
+                     state="readonly").grid(row=1, column=1, sticky="w", padx=4, pady=3)
+
+        ttk.Label(opt, text="Profil suara:").grid(row=1, column=2, sticky="w", padx=4, pady=3)
+        self._gen_voice_keys = list(ffgen.VOICE_PROFILES.keys())
+        self.gen_voice_combo = ttk.Combobox(
+            opt, values=self._gen_voice_keys, width=14, state="readonly")
+        self.gen_voice_combo.current(0)
+        self.gen_voice_combo.grid(row=1, column=3, sticky="w", padx=4, pady=3)
+
+        ttk.Label(opt, text="Nada emosional:").grid(row=2, column=0, sticky="w", padx=4, pady=3)
+        self._gen_tone_keys = list(ffgen.EMOTIONAL_TONES.keys())
+        self.gen_tone_combo = ttk.Combobox(
+            opt, values=self._gen_tone_keys, width=14, state="readonly")
+        self.gen_tone_combo.current(1)  # antusias
+        self.gen_tone_combo.grid(row=2, column=1, sticky="w", padx=4, pady=3)
+
+        ttk.Label(opt, text="Latar belakang:").grid(row=3, column=0, sticky="nw", padx=4, pady=3)
+        self.gen_bg_var = tk.StringVar(
+            value="Meja rias kayu minimalis dengan pencahayaan hangat")
+        ttk.Entry(opt, textvariable=self.gen_bg_var, width=58).grid(
+            row=3, column=1, columnspan=3, sticky="we", padx=4, pady=3)
+
+        # ── Upload row ──────────────────────────────────────────────
+        up = ttk.Labelframe(parent, text="  Upload  ", padding=10)
+        up.pack(fill="x", pady=(0, 8))
+        ttk.Button(up, text="📷 Tambah Foto Model",
+                   command=lambda: self._gen_add_imgs("model")).grid(
+                       row=0, column=0, padx=4, pady=4, sticky="w")
+        self.gen_model_lbl = ttk.Label(up, text="0 foto", style="Dim.TLabel")
+        self.gen_model_lbl.grid(row=0, column=1, padx=4, sticky="w")
+        ttk.Button(up, text="🧴 Tambah Foto Produk",
+                   command=lambda: self._gen_add_imgs("product")).grid(
+                       row=1, column=0, padx=4, pady=4, sticky="w")
+        self.gen_product_lbl = ttk.Label(up, text="0 foto", style="Dim.TLabel")
+        self.gen_product_lbl.grid(row=1, column=1, padx=4, sticky="w")
+        ttk.Button(up, text="🗑 Kosongkan",
+                   command=self._gen_clear_imgs).grid(row=0, column=2, rowspan=2, padx=12)
+
+        # ── Auto-chain toggle + run button ──────────────────────────
+        run_row = ttk.Frame(parent)
+        run_row.pack(fill="x", pady=(2, 8))
+        self.gen_autochain_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            run_row,
+            text="Auto lanjut ke Grok (batch video) setelah zip jadi",
+            variable=self.gen_autochain_var).pack(side="left")
+
+        self.gen_run_btn = ttk.Button(
+            parent, text="🚀  GENERATE  (ChatGPT → ZIP → Grok)",
+            style="Accent.TButton", command=self._gen_run)
+        self.gen_run_btn.pack(fill="x", pady=(0, 8))
+
+        # ── Log ─────────────────────────────────────────────────────
+        self.gen_log = tk.Text(parent, height=12, wrap="word",
+                               background="#16213e", foreground="#c1c2c5",
+                               insertbackground="#fff", relief="flat",
+                               font=("Consolas", 9))
+        self.gen_log.pack(fill="both", expand=True)
+        self.gen_log.insert("end", "Siap. Upload foto sesuai mode, atur opsi, lalu Generate.\n")
+        self.gen_log.configure(state="disabled")
+
+        self._gen_busy = False
+        self._gen_on_mode_change()
+
+    def _gen_mode_key(self) -> str:
+        return self._gen_mode_keys[self.gen_mode_combo.current()]
+
+    def _gen_on_mode_change(self):
+        mk = self._gen_mode_key()
+        needs = ffgen.MODES[mk]["needs"]
+        parts = []
+        if "model" in needs:
+            parts.append("foto MODEL")
+        if "product" in needs:
+            parts.append("foto PRODUK")
+        self.gen_mode_hint.configure(text="Perlu: " + " + ".join(parts))
+
+    def _gen_log_msg(self, msg: str):
+        def _w():
+            self.gen_log.configure(state="normal")
+            self.gen_log.insert("end", msg + "\n")
+            self.gen_log.see("end")
+            self.gen_log.configure(state="disabled")
+        self.root.after(0, _w)
+
+    def _gen_add_imgs(self, kind: str):
+        paths = filedialog.askopenfilenames(
+            title=f"Pilih foto {kind}",
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.webp"), ("All", "*.*")])
+        if not paths:
+            return
+        target = self.gen_model_imgs if kind == "model" else self.gen_product_imgs
+        for p in paths:
+            target.append(Path(p))
+        self._gen_refresh_upload_labels()
+
+    def _gen_clear_imgs(self):
+        self.gen_model_imgs.clear()
+        self.gen_product_imgs.clear()
+        self._gen_refresh_upload_labels()
+
+    def _gen_refresh_upload_labels(self):
+        self.gen_model_lbl.configure(text=f"{len(self.gen_model_imgs)} foto")
+        self.gen_product_lbl.configure(text=f"{len(self.gen_product_imgs)} foto")
+
+    def _gen_run(self):
+        if self._gen_busy:
+            self._gen_log_msg("⚠ Masih ada proses berjalan.")
+            return
+
+        mode = self._gen_mode_key()
+        err = ffgen.validate_uploads(
+            mode,
+            has_model=bool(self.gen_model_imgs),
+            has_product=bool(self.gen_product_imgs))
+        if err:
+            messagebox.showwarning("Upload kurang", err)
+            return
+
+        try:
+            num_scenes = max(1, min(10, int(self.gen_scenes_var.get())))
+        except ValueError:
+            num_scenes = 2
+
+        params = {
+            "mode": mode,
+            "num_scenes": num_scenes,
+            "project_name": self.gen_project_var.get().strip() or "Project",
+            "aspect": self.gen_aspect_var.get(),
+            "voice_key": self._gen_voice_keys[self.gen_voice_combo.current()],
+            "tone_key": self._gen_tone_keys[self.gen_tone_combo.current()],
+            "background": self.gen_bg_var.get().strip(),
+            "autochain": self.gen_autochain_var.get(),
+            "model_imgs": list(self.gen_model_imgs),
+            "product_imgs": list(self.gen_product_imgs),
+        }
+
+        self._gen_busy = True
+        self.gen_run_btn.configure(state="disabled", text="⏳ Memproses...")
+        threading.Thread(target=self._gen_worker, args=(params,), daemon=True).start()
+
+    def _gen_worker(self, params: dict):
+        """Runs off the UI thread. ChatGPT → zip → (optional) Grok batch."""
+        try:
+            label = "default"
+
+            # 1) Build the ChatGPT prompt
+            prompt = ffgen.build_chatgpt_prompt(
+                mode=params["mode"],
+                num_scenes=params["num_scenes"],
+                background=params["background"],
+                voice_key=params["voice_key"],
+                tone_key=params["tone_key"],
+                aspect=params["aspect"],
+            )
+            self._gen_log_msg("📝 Mengirim brief ke ChatGPT...")
+
+            bridge = self._ensure_bridge_for("chatgpt")
+            try:
+                bridge.start_new_chat("chatgpt", label)
+            except Exception:
+                pass
+
+            result = bridge.chat("chatgpt", prompt, label=label,
+                                 timeout=180, force_new_chat=True)
+            if not result.get("ok"):
+                self._gen_log_msg(f"✗ ChatGPT gagal: {result.get('error', '?')}")
+                return
+
+            reply = result.get("response", "") or result.get("text", "") or ""
+            try:
+                script = ffgen.parse_script_json(reply)
+            except Exception as e:
+                self._gen_log_msg(f"✗ Gagal baca skrip JSON dari ChatGPT: {e}")
+                self._gen_log_msg("   Balasan mentah:\n" + reply[:600])
+                return
+
+            scenes = script["scenes"]
+            self._gen_log_msg(f"✓ ChatGPT balas {len(scenes)} scene.")
+
+            # 2) Map images to scenes per mode
+            needs = ffgen.MODES[params["mode"]]["needs"]
+            if "model" in needs and params["model_imgs"]:
+                primary = params["model_imgs"]
+            elif params["product_imgs"]:
+                primary = params["product_imgs"]
+            else:
+                primary = params["model_imgs"]
+
+            scene_images: dict[int, Path] = {}
+            for i in range(1, len(scenes) + 1):
+                scene_images[i] = primary[(i - 1) % len(primary)]
+
+            # 3) Assemble the zip
+            out_dir = MEDIA_DIR / "generated"
+            self._gen_log_msg("📦 Merakit ZIP aset...")
+            zip_path = ffgen.assemble_zip(
+                out_dir=out_dir,
+                project_name=params["project_name"],
+                script=script,
+                mode=params["mode"],
+                background=params["background"],
+                aspect=params["aspect"],
+                voice_key=params["voice_key"],
+                tone_key=params["tone_key"],
+                scene_images=scene_images,
+            )
+            self._gen_log_msg(f"✓ ZIP siap: {zip_path}")
+
+            if not params["autochain"]:
+                self._gen_log_msg("ℹ Auto-chain mati. Buka tab Chat → Batch ZIP untuk lanjut ke Grok.")
+                return
+
+            # 4) Auto-chain into Grok batch video
+            self._gen_log_msg("⚡ Lanjut ke Grok Imagine (batch video)...")
+            self.root.after(0, lambda: self._gen_run_grok_batch(
+                zip_path, params["aspect"]))
+
+        except Exception as e:
+            self._gen_log_msg(f"✗ Error: {e}")
+        finally:
+            if not params.get("autochain"):
+                self.root.after(0, self._gen_unlock)
+
+    def _gen_run_grok_batch(self, zip_path: Path, aspect: str):
+        """Feed the freshly-built zip into the existing Grok batch pipeline."""
+        try:
+            # Configure Imagine for video + chosen aspect, then run batch.
+            self.imagine_enabled_var.set(True)
+            self._on_imagine_toggle()
+            self.imagine_mode_var.set("video")
+            self._on_imagine_mode_changed()
+            self.imagine_aspect_var.set(aspect)
+            self.chat_platform_var.set("grok")
+            self._gen_log_msg("→ Memakai pipeline Batch ZIP yang sudah ada di tab Chat.")
+            self._batch_zip_from_path(zip_path)
+        except Exception as e:
+            self._gen_log_msg(f"✗ Gagal mulai batch Grok: {e}")
+        finally:
+            self._gen_unlock()
+
+    def _gen_unlock(self):
+        self._gen_busy = False
+        self.gen_run_btn.configure(state="normal",
+                                   text="🚀  GENERATE  (ChatGPT → ZIP → Grok)")
 
     def _build_chat_tab(self, parent):
         """Build Chat tab with two sub-tabs: ChatGPT and Grok (run simultaneously)."""
@@ -652,80 +951,87 @@ class AIChatBridgeApp:
 
     # ---- Recent chats ------------------------------------------------
     def _fetch_recent_chats(self, pk: str, listbox: tk.Listbox):
-        """Fetch recent conversations from the platform's web API using saved session cookies."""
+        """Fetch recent conversations from the platform's web API.
+
+        ChatGPT: uses /api/auth/session token fetched from the running browser
+                 (if browser not open yet, falls back to cookie-only which may 401).
+        Grok:    uses session cookies directly — works without browser.
+        """
         listbox.delete(0, "end")
         listbox.insert("end", "⏳ Loading...")
         panel = self._platform_panels.get(pk, {})
 
         def worker():
-            try:
-                import json as _json
-                import http.cookiejar
-                import urllib.request
+            import json as _json
+            import urllib.request
+            import urllib.error
 
-                session_file = SESSIONS_DIR / f"{pk}_default.json"
+            try:
+                # ── Find session file ───────────────────────────────────
+                label = panel.get("label_var", tk.StringVar()).get().strip() or "default"
+                session_file = SESSIONS_DIR / f"{pk}_{label}.json"
                 if not session_file.exists():
-                    label = panel.get("label_var", tk.StringVar()).get().strip() or "default"
-                    session_file = SESSIONS_DIR / f"{pk}_{label}.json"
+                    session_file = SESSIONS_DIR / f"{pk}_default.json"
                 if not session_file.exists():
-                    self.root.after(0, self._set_recent_error, pk, listbox, "No session file found")
+                    self.root.after(0, self._set_recent_error, pk, listbox,
+                                    "No session file — capture session first")
                     return
 
                 raw = _json.loads(session_file.read_text("utf-8"))
                 cookies_list = raw.get("cookies", [])
-
-                jar = http.cookiejar.CookieJar()
-
-                class _FakeCookie:
-                    def __init__(self, c):
-                        self.name = c["name"]
-                        self.value = c["value"]
-                        self.domain = c.get("domain", "")
-                        self.path = c.get("path", "/")
-                        self.secure = c.get("secure", False)
-                        self.expires = int(c.get("expires", -1)) if c.get("expires", -1) != -1 else None
-                        self.has_nonstandard_attr = lambda *a: False
-                        self.is_expired = lambda: False
-                        self.discard = False
-                        self.comment = None
-                        self.comment_url = None
-                        self.rfc2109 = False
-                        self.port = None
-                        self.port_specified = False
-                        self.domain_specified = True
-                        self.domain_initial_dot = self.domain.startswith(".")
-                        self.path_specified = True
-                        self._rest = {}
-
-                for c in cookies_list:
-                    jar._cookies.setdefault(c.get("domain", ""), {}).setdefault(
-                        c.get("path", "/"), {})[c["name"]] = _FakeCookie(c)
-
-                # Build cookie header manually
                 cookie_header = "; ".join(
-                    f"{c['name']}={c['value']}" for c in cookies_list
-                    if c.get("value")
+                    f"{c['name']}={c['value']}" for c in cookies_list if c.get("value")
                 )
 
                 if pk == "chatgpt":
-                    url = "https://chatgpt.com/backend-api/conversations?offset=0&limit=28&order=updated"
-                    req = urllib.request.Request(url, headers={
+                    # ── Try to get Bearer token from running browser ────
+                    access_token = ""
+                    bridge = self._bridges.get("chatgpt")
+                    if bridge is not None:
+                        try:
+                            access_token = bridge.get_access_token("chatgpt", label)
+                        except Exception:
+                            pass
+
+                    url = ("https://chatgpt.com/backend-api/conversations"
+                           "?offset=0&limit=28&order=updated")
+                    headers = {
                         "Cookie": cookie_header,
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                       "Chrome/124.0.0.0 Safari/537.36"),
                         "Referer": "https://chatgpt.com/",
-                    })
-                    with urllib.request.urlopen(req, timeout=10) as resp:
-                        data = _json.loads(resp.read())
-                    items = data.get("items", [])
-                    chats = [{"id": it["id"], "title": it.get("title", "Untitled")} for it in items]
+                        "Accept": "application/json",
+                    }
+                    if access_token:
+                        headers["Authorization"] = f"Bearer {access_token}"
+
+                    req = urllib.request.Request(url, headers=headers)
+                    try:
+                        with urllib.request.urlopen(req, timeout=10) as resp:
+                            data = _json.loads(resp.read())
+                        items = data.get("items", [])
+                        chats = [{"id": it["id"],
+                                  "title": it.get("title", "Untitled")} for it in items]
+                    except urllib.error.HTTPError as e:
+                        if e.code == 401 and not access_token:
+                            # Browser not running — tell user to open it first
+                            self.root.after(0, self._set_recent_error, pk, listbox,
+                                            "Open ChatGPT browser first (Send any msg), then Refresh")
+                        else:
+                            self.root.after(0, self._set_recent_error, pk, listbox,
+                                            f"HTTP {e.code}: {e.reason}")
+                        return
 
                 elif pk == "grok":
                     url = "https://grok.com/rest/app-chat/conversations?pageSize=28"
                     req = urllib.request.Request(url, headers={
                         "Cookie": cookie_header,
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                       "Chrome/124.0.0.0 Safari/537.36"),
                         "Referer": "https://grok.com/",
-                        "Content-Type": "application/json",
+                        "Accept": "application/json",
                     })
                     with urllib.request.urlopen(req, timeout=10) as resp:
                         data = _json.loads(resp.read())
@@ -771,18 +1077,101 @@ class AIChatBridgeApp:
         chat = chats[idx]
         title = chat.get("title", "")
         chat_id = chat.get("id", "")
-        self._enqueue_log(f"[{pk}] Selected recent chat: {title} (id={chat_id})")
-        # Show the URL/ID in the display
+        if not chat_id:
+            return
+
+        if pk == "chatgpt":
+            url = f"https://chatgpt.com/c/{chat_id}"
+        else:
+            url = f"https://grok.com/chat/{chat_id}"
+
+        label = panel.get("label_var", tk.StringVar()).get().strip() or "default"
         display = panel.get("display")
+
+        # Clear display and show loading state
         if display:
             display.configure(state="normal")
-            if pk == "chatgpt":
-                url = f"https://chatgpt.com/c/{chat_id}"
-            else:
-                url = f"https://grok.com/chat/{chat_id}"
-            display.insert("end", f"\n[Recent chat loaded] {title}\n{url}\n", "system")
+            display.delete("1.0", "end")
+            display.insert("end", f"━━ {title} ━━\n", "divider")
+            display.insert("end", f"{url}\n", "system")
+            display.insert("end", "⏳ Loading chat history...\n", "system")
             display.see("end")
             display.configure(state="disabled")
+
+        self._enqueue_log(f"[{pk}] Opening: {title}")
+
+        def do_navigate(bridge_getter):
+            try:
+                bridge = bridge_getter()
+                messages = bridge.navigate_to_chat(pk, url, label)
+                self.root.after(0, self._display_chat_history, pk, display, title, url, messages)
+            except Exception as e:
+                self.root.after(0, self._enqueue_log, f"✗ {pk} navigate failed: {e}")
+                if display:
+                    self.root.after(0, lambda: (
+                        display.configure(state="normal"),
+                        display.insert("end", f"[ERROR] {e}\n", "system"),
+                        display.configure(state="disabled"),
+                    ))
+
+        bridge = self._bridges.get(pk)
+        if bridge is None:
+            self._enqueue_log(f"[{pk}] Browser not running, launching...")
+            threading.Thread(
+                target=do_navigate,
+                args=(lambda: self._ensure_bridge_for(pk),),
+                daemon=True
+            ).start()
+        else:
+            threading.Thread(
+                target=do_navigate,
+                args=(lambda: bridge,),
+                daemon=True
+            ).start()
+
+    def _display_chat_history(self, pk: str, display: tk.Text, title: str,
+                               url: str, messages: list):
+        """Render scraped chat history into the platform display widget."""
+        if display is None:
+            return
+        try:
+            display.configure(state="normal")
+            display.delete("1.0", "end")
+
+            # Header
+            display.insert("end", f"━━ {title} ━━\n", "divider")
+            display.insert("end", f"{url}\n\n", "system")
+
+            if not messages:
+                display.insert("end",
+                    "(Tidak ada riwayat yang bisa di-scrape — "
+                    "mungkin chat kosong atau halaman belum load sepenuhnya)\n",
+                    "system")
+                display.insert("end",
+                    "[✓ Chat open — kirim pesan untuk melanjutkan]\n", "system")
+                display.see("end")
+                display.configure(state="disabled")
+                self._enqueue_log(f"[{pk}] Chat opened, no history scraped")
+                return
+
+            for msg in messages:
+                role = msg.get("role", "")
+                text = msg.get("text", "").strip()
+                if not text:
+                    continue
+                if role == "user":
+                    display.insert("end", f"[You] {text}\n\n", "user")
+                else:
+                    display.insert("end", f"[{pk}] {text}\n\n", "ai")
+
+            display.insert("end",
+                f"─── {len(messages)} messages loaded ─── kirim pesan untuk melanjutkan ───\n",
+                "divider")
+            display.see("end")
+            display.configure(state="disabled")
+            self._enqueue_log(f"[{pk}] Loaded {len(messages)} messages from: {title}")
+        except Exception as e:
+            self._enqueue_log(f"[{pk}] Display history error: {e}")
 
     # ---- Per-platform bridge controls ---------------------------------
     def _ensure_bridge_for(self, pk: str):
@@ -1426,6 +1815,15 @@ class AIChatBridgeApp:
             filetypes=[("ZIP files", "*.zip"), ("All files", "*.*")]
         )
         if not zip_path:
+            return
+        self._batch_zip_from_path(zip_path)
+
+    def _batch_zip_from_path(self, zip_path):
+        """Process a known ZIP path (Scene_1/, Scene_2/, ...). Shared by the
+        manual Batch button and the Generator auto-chain."""
+        zip_path = str(zip_path)
+        if self._chat_busy.get("grok"):
+            self._enqueue_log("⚠ Tunggu proses sebelumnya selesai dulu.")
             return
 
         import re
