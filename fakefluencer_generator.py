@@ -188,6 +188,71 @@ def build_chatgpt_prompt(
     return "\n".join(role_lines) + "\n\n" + schema
 
 
+def build_scene_image_prompt(
+    *,
+    mode: str,
+    scene_action: str,
+    spoken: str,
+    background: str,
+    aspect: str,
+    product_name: str = "",
+) -> str:
+    """Prompt for Grok Imagine (IMAGE mode) that composes ONE still per scene.
+
+    The uploaded model photo(s) and product photo(s) are attached as
+    references; this text tells Imagine to MERGE them into a single
+    photoreal frame that matches the scene's on-screen action. That merged
+    still is what each Scene_N/image.png should contain (like the original
+    Toner_MS_Glow pack, where every scene has a distinct composited image).
+    """
+    m = MODES.get(mode, MODES["ugc"])
+    needs = m["needs"]
+    refs = []
+    if "model" in needs:
+        refs.append("the SAME person from the attached model photo (keep her "
+                    "face, hairstyle and skin identical)")
+    if "product" in needs:
+        refs.append("the EXACT product from the attached product photo "
+                    "(keep the bottle shape, label and text identical)")
+    ref_clause = " and ".join(refs) if refs else "the attached reference photo"
+
+    prod = f" The product is {product_name}." if product_name else ""
+
+    # Scale guidance: without this the model tends to render the product
+    # far too large relative to the hand/face. Anchor it to a small,
+    # one-hand-held bottle and add negatives for oversized renders.
+    scale_clause = ""
+    if "product" in needs:
+        scale_clause = (
+            " IMPORTANT product scale: this is a small travel-size bottle "
+            "(about 50 ml), roughly the length of the model's palm. It must "
+            "be held comfortably in ONE hand with the fingers and thumb "
+            "wrapping naturally around it, fingertips nearly meeting. The "
+            "bottle height should be about half the length of her face. Keep "
+            "the proportions realistic for a small cosmetic bottle — never "
+            "oversized."
+        )
+
+    negatives = "no on-screen captions, no watermark, no extra people"
+    if "product" in needs:
+        negatives += (
+            ", no oversized or giant bottle, bottle not larger than the hand, "
+            "no distorted or unrealistic product scale"
+        )
+
+    return (
+        f"Create a single photoreal vertical image. Combine {ref_clause} into "
+        f"one natural frame.{prod}{scale_clause} "
+        f"Camera: {m['camera']} "
+        f"Setting/background: {background}. "
+        f"On-screen action for this exact moment: {scene_action} "
+        f"The model is mid-sentence saying (do not render text, just match her "
+        f"expression): \"{spoken}\". "
+        f"Aspect ratio {aspect}. Authentic UGC look, soft natural lighting, "
+        f"{negatives}."
+    )
+
+
 # ──────────────────────────────────────────────────────────────────────
 # 4. PARSE CHATGPT'S REPLY
 # ──────────────────────────────────────────────────────────────────────

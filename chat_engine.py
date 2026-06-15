@@ -575,6 +575,31 @@ class ChatSession:
         return self._has_active_chat
 
     # ------------------------------------------------------------------
+    # Typing helpers
+    # ------------------------------------------------------------------
+
+    def _type_multiline(self, page, text: str, delay: int = 10) -> None:
+        """Type text into the focused input WITHOUT submitting on newlines.
+
+        On Grok / ChatGPT / AI Studio the prompt box submits when a bare
+        Enter is pressed.  page.keyboard.type() turns every '\\n' in the
+        text into a real Enter, which sends the message line-by-line and
+        produces the "partial send" / "Request was interrupted" bug.
+
+        Fix: type each line of text normally, and between lines insert a
+        newline with Shift+Enter (a soft line break that does NOT submit).
+        Carriage returns are stripped so '\\r\\n' doesn't double up.
+        """
+        text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+        lines = text.split("\n")
+        for i, line in enumerate(lines):
+            if line:
+                page.keyboard.type(line, delay=delay)
+            if i < len(lines) - 1:
+                # Soft newline inside the textbox; does not send the message.
+                page.keyboard.press("Shift+Enter")
+
+    # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
@@ -621,8 +646,17 @@ class ChatSession:
         #   - caller forced it, OR
         #   - we don't yet have an active chat in this session
         is_new_chat = force_new_chat or not self._has_active_chat
-        if force_new_chat and self._has_active_chat:
-            self.start_new_chat()
+        # For a forced new chat on a *text* request, always navigate to a
+        # clean conversation — even if we think there's no active chat. The
+        # browser may already be sitting on an old chat URL (e.g. reused
+        # session), which previously caused replies to append to the wrong
+        # conversation. Imagine mode handles its own navigation to /imagine,
+        # so skip the home reset there.
+        if force_new_chat and not (imagine_opts and self.platform == "grok"):
+            try:
+                self.start_new_chat()
+            except Exception as e:
+                logger.warning(f"[{self.platform}] start_new_chat failed: {e}")
 
         start = time.time()
         try:
@@ -939,7 +973,7 @@ class ChatSession:
             page.keyboard.press("Control+a")
             page.keyboard.press("Delete")
             page.wait_for_timeout(200)
-            page.keyboard.type(message, delay=10)
+            self._type_multiline(page, message, delay=10)
             page.wait_for_timeout(400)
 
         existing_msgs = page.query_selector_all('[data-message-author-role="assistant"]')
@@ -1429,7 +1463,7 @@ class ChatSession:
         except Exception:
             pass
         page.wait_for_timeout(150)
-        page.keyboard.type(message, delay=8)
+        self._type_multiline(page, message, delay=8)
         page.wait_for_timeout(300)
 
         # Send: prefer a real Send button; fall back to Enter ONCE.
@@ -1538,6 +1572,27 @@ class ChatSession:
                 page.wait_for_timeout(300)
         except Exception:
             pass
+
+        # ---- Close any open dropdown/menu/overlay that intercepts clicks ----
+        # The upload menu ("Upload a file / Recent / Skills / Add connector")
+        # and similar floating menus sit on top of the page and swallow pointer
+        # events, which makes input_el.click() time out with
+        # "<html ...> intercepts pointer events". Press Escape to close them.
+        try:
+            overlay = page.query_selector(
+                '[role="menu"]:visible, [role="dialog"]:visible, '
+                '[role="listbox"]:visible, [data-state="open"][role="menu"]'
+            )
+            if overlay:
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(200)
+                # Second Escape in case the first only closed a submenu.
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(150)
+                dismissed.append("overlay:escape")
+        except Exception:
+            pass
+
         if dismissed:
             logger.info(f"[grok] dismissed popups: {dismissed}")
         return dismissed
@@ -1607,12 +1662,33 @@ class ChatSession:
 
         # ---- Type ----
         try:
-            input_el.click()
+            # Make sure no floating menu/overlay is intercepting clicks before
+            # we focus the input. The upload dropdown ("Upload a file / Recent
+            # / Skills") is the usual culprit behind the 30s click timeout.
+            self._dismiss_grok_popups()
+            try:
+                # Short timeout so a lingering overlay fails fast instead of
+                # blocking for the full 30s default. We recover below.
+                input_el.click(timeout=4000)
+            except Exception:
+                # Click was intercepted (overlay on top). Force-close menus and
+                # focus the input directly via JS, then carry on.
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(200)
+                self._dismiss_grok_popups()
+                try:
+                    input_el.click(timeout=4000)
+                except Exception:
+                    # Last resort: focus through the DOM without a pointer click.
+                    try:
+                        input_el.evaluate("el => el.focus()")
+                    except Exception:
+                        raise
             page.wait_for_timeout(300)
             page.keyboard.press("Control+a")
             page.keyboard.press("Delete")
             page.wait_for_timeout(150)
-            page.keyboard.type(message, delay=10)
+            self._type_multiline(page, message, delay=10)
             page.wait_for_timeout(400)
         except Exception as e:
             self._dump_phase("03a_type_error")
@@ -1631,7 +1707,7 @@ class ChatSession:
             try:
                 btn = page.query_selector(sel)
                 if btn and btn.is_visible() and btn.is_enabled():
-                    btn.click()
+                    btn.click(timeout=4000)
                     sent_by = sel
                     break
             except Exception:
@@ -2089,7 +2165,7 @@ class ChatSession:
             page.keyboard.press("Control+a")
             page.keyboard.press("Delete")
             page.wait_for_timeout(150)
-            page.keyboard.type(prompt, delay=10)
+            self._type_multiline(page, prompt, delay=10)
             page.wait_for_timeout(400)
         except Exception as e:
             raise RuntimeError(f"Failed typing Imagine prompt: {e}")
@@ -2314,7 +2390,54 @@ class ChatSession:
             )
 
         self._dump_phase("imagine_10_done")
+        # Close any open result/preview modal so the next scene (or the user)
+        # isn't blocked by a stuck fullscreen image popup.
+        self._close_imagine_preview()
         return {"text": response_text, "media": result_media}
+
+    def _close_imagine_preview(self):
+        """Dismiss the fullscreen image/video preview modal that Grok opens
+        after a generation completes. Tries the Close (X) button first, then
+        Escape, then a click on the dark backdrop."""
+        page = self._page
+        for _ in range(3):
+            try:
+                closed = page.evaluate("""() => {
+                    // 1) Explicit close buttons (X / aria-label Close)
+                    const btns = Array.from(document.querySelectorAll(
+                        'button[aria-label="Close"], button[aria-label*="close" i], ' +
+                        '[role="dialog"] button'));
+                    for (const b of btns) {
+                        const r = b.getBoundingClientRect();
+                        // top-right corner X of an open modal
+                        if (r.width > 0 && r.top < 160 && r.left > window.innerWidth * 0.6) {
+                            b.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                }""")
+                if closed:
+                    page.wait_for_timeout(400)
+                    continue
+            except Exception:
+                pass
+            # Fallback: Escape closes radix/headless dialogs.
+            try:
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(300)
+            except Exception:
+                pass
+            # Stop once no dialog/overlay remains visible.
+            try:
+                still = page.evaluate("""() => {
+                    const d = document.querySelector('[role="dialog"], [data-state="open"].fixed.inset-0');
+                    return !!(d && d.getBoundingClientRect().width > 0);
+                }""")
+                if not still:
+                    break
+            except Exception:
+                break
 
     def _dump_phase(self, tag: str):
         if not os.environ.get("DEBUG_PHASES"):
@@ -2696,6 +2819,31 @@ class BridgeWorker:
             pool.close_all()
             return True
         return self._execute(op, queue_timeout=120)
+
+    def abort(self) -> None:
+        """Force-stop everything immediately, even mid-operation.
+
+        Unlike close_all_sessions (which is queued behind the running op and
+        therefore cannot interrupt a stuck chat()), abort() closes the
+        browsers directly from the *calling* thread. Closing the browser makes
+        any in-flight Playwright call on the worker thread raise at once, so a
+        hung typing/click returns instead of blocking until timeout.
+
+        Safe to call from the GUI/cancel thread. After abort() the worker is
+        shut down; create a fresh BridgeWorker for the next request.
+        """
+        # 1) Close the live pool's browsers out-of-band to unblock the worker.
+        pool = self._pool
+        if pool is not None:
+            try:
+                pool.close_all()
+            except Exception:
+                logger.exception("abort: pool.close_all failed")
+        # 2) Tell the worker thread to exit (don't wait — it may be unwinding).
+        try:
+            self.shutdown(wait=False)
+        except Exception:
+            pass
 
     def list_active_sessions(self) -> list:
         """Read-only snapshot of currently open browser sessions. Non-blocking."""

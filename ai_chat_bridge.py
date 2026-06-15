@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import queue
+import shutil
 import subprocess
 import sys
 import threading
@@ -110,6 +111,8 @@ class AIChatBridgeApp:
         self._bridges: dict[str, object] = {"chatgpt": None, "grok": None}
         self._bridge_headless: dict[str, bool] = {"chatgpt": None, "grok": None}
         self._chat_busy: dict[str, bool] = {"chatgpt": False, "grok": False}
+        # Set when the user clicks Cancel during a running batch / generate.
+        self._batch_cancel = threading.Event()
         # Keep legacy alias so _poll_browser_status still works during refactor
         self._bridge = None  # unused — kept to avoid AttributeError on old refs
 
@@ -505,18 +508,33 @@ class AIChatBridgeApp:
                   style="Dim.TLabel").grid(row=4, column=2, columnspan=2,
                                            sticky="w", padx=4, pady=3)
 
-        # ── Opsi VIDEO — durasi & resolusi saat batch Grok Imagine ──
-        ttk.Label(opt, text="Durasi video:").grid(row=5, column=0, sticky="w", padx=4, pady=3)
-        self.gen_vdur_var = tk.StringVar(value="6s")
-        ttk.Combobox(opt, textvariable=self.gen_vdur_var,
-                     values=["6s", "10s"], width=8,
-                     state="readonly").grid(row=5, column=1, sticky="w", padx=4, pady=3)
+        # ── Output: image atau video (Grok Imagine mode) ──
+        ttk.Label(opt, text="Output:").grid(row=6, column=0, sticky="w", padx=4, pady=3)
+        self.gen_output_var = tk.StringVar(value="video")
+        out_frame = ttk.Frame(opt)
+        out_frame.grid(row=6, column=1, columnspan=3, sticky="w", padx=4, pady=3)
+        ttk.Radiobutton(out_frame, text="🎬 Video", value="video",
+                        variable=self.gen_output_var,
+                        command=self._gen_on_output_change).pack(side="left", padx=(0, 12))
+        ttk.Radiobutton(out_frame, text="🖼 Image", value="image",
+                        variable=self.gen_output_var,
+                        command=self._gen_on_output_change).pack(side="left")
 
-        ttk.Label(opt, text="Resolusi video:").grid(row=5, column=2, sticky="w", padx=4, pady=3)
+        # ── Opsi VIDEO — durasi & resolusi saat batch Grok Imagine ──
+        self.gen_vdur_label = ttk.Label(opt, text="Durasi video:")
+        self.gen_vdur_label.grid(row=5, column=0, sticky="w", padx=4, pady=3)
+        self.gen_vdur_var = tk.StringVar(value="6s")
+        self.gen_vdur_combo = ttk.Combobox(opt, textvariable=self.gen_vdur_var,
+                     values=["6s", "10s"], width=8, state="readonly")
+        self.gen_vdur_combo.grid(row=5, column=1, sticky="w", padx=4, pady=3)
+
+        self.gen_vres_label = ttk.Label(opt, text="Resolusi video:")
+        self.gen_vres_label.grid(row=5, column=2, sticky="w", padx=4, pady=3)
         self.gen_vres_var = tk.StringVar(value="720p")
-        ttk.Combobox(opt, textvariable=self.gen_vres_var,
+        self.gen_vres_combo = ttk.Combobox(opt, textvariable=self.gen_vres_var,
                      values=["720p (Quality)", "480p (Speed)"], width=14,
-                     state="readonly").grid(row=5, column=3, sticky="w", padx=4, pady=3)
+                     state="readonly")
+        self.gen_vres_combo.grid(row=5, column=3, sticky="w", padx=4, pady=3)
 
         ttk.Label(opt, text="Format gambar:").grid(row=1, column=0, sticky="w", padx=4, pady=3)
         self.gen_aspect_var = tk.StringVar(value="9:16")
@@ -572,7 +590,14 @@ class AIChatBridgeApp:
         self.gen_run_btn = ttk.Button(
             parent, text="🚀  GENERATE  (ChatGPT → ZIP → Grok)",
             style="Accent.TButton", command=self._gen_run)
-        self.gen_run_btn.pack(fill="x", pady=(0, 8))
+        self.gen_run_btn.pack(fill="x", pady=(0, 4))
+
+        # Cancel button for the Generator tab. Lets the user abort a stuck or
+        # long-running generate without killing the whole program.
+        self.gen_cancel_btn = ttk.Button(
+            parent, text="✖  Cancel", command=self._gen_cancel,
+            state="disabled")
+        self.gen_cancel_btn.pack(fill="x", pady=(0, 8))
 
         # ── Log ─────────────────────────────────────────────────────
         self.gen_log = tk.Text(parent, height=12, wrap="word",
@@ -585,6 +610,7 @@ class AIChatBridgeApp:
 
         self._gen_busy = False
         self._gen_on_mode_change()
+        self._gen_on_output_change()
 
     def _gen_mode_key(self) -> str:
         return self._gen_mode_keys[self.gen_mode_combo.current()]
@@ -598,6 +624,34 @@ class AIChatBridgeApp:
         if "product" in needs:
             parts.append("foto PRODUK")
         self.gen_mode_hint.configure(text="Perlu: " + " + ".join(parts))
+
+    def _gen_on_output_change(self):
+        """Enable/disable the video-only options based on Output selection."""
+        try:
+            is_video = self.gen_output_var.get() == "video"
+        except Exception:
+            is_video = True
+        state = "readonly" if is_video else "disabled"
+        fg = "#c1c2c5" if is_video else "#5c5f66"
+        for w in (getattr(self, "gen_vdur_combo", None),
+                  getattr(self, "gen_vres_combo", None)):
+            if w is not None:
+                try:
+                    w.configure(state=state)
+                except Exception:
+                    pass
+        for lbl in (getattr(self, "gen_vdur_label", None),
+                    getattr(self, "gen_vres_label", None)):
+            if lbl is not None:
+                try:
+                    lbl.configure(foreground=fg)
+                except Exception:
+                    pass
+        # Update the big button text to reflect image vs video pipeline.
+        if hasattr(self, "gen_run_btn"):
+            tail = "Grok (video)" if is_video else "Grok (image)"
+            self.gen_run_btn.configure(
+                text=f"🚀  GENERATE  (Script → ZIP → {tail})")
 
     def _gen_log_msg(self, msg: str):
         def _w():
@@ -657,6 +711,7 @@ class AIChatBridgeApp:
             "mode": mode,
             "num_scenes": num_scenes,
             "provider": provider,
+            "output_mode": self.gen_output_var.get(),  # "image" | "video"
             # Video options applied when batching to Grok Imagine
             "video_duration": "10s" if self.gen_vdur_var.get().startswith("10") else "6s",
             "video_resolution": "480p" if self.gen_vres_var.get().startswith("480") else "720p",
@@ -671,6 +726,11 @@ class AIChatBridgeApp:
         }
 
         self._gen_busy = True
+        self._batch_cancel.clear()
+        if getattr(self, "cancel_btn", None) is not None:
+            self.cancel_btn.configure(state="normal")
+        if getattr(self, "gen_cancel_btn", None) is not None:
+            self.gen_cancel_btn.configure(state="normal")
         self.gen_run_btn.configure(state="disabled", text="⏳ Memproses...")
         threading.Thread(target=self._gen_worker, args=(params,), daemon=True).start()
 
@@ -729,20 +789,87 @@ class AIChatBridgeApp:
                 return
 
             scenes = script["scenes"]
-            self._gen_log_msg(f"✓ ChatGPT balas {len(scenes)} scene.")
+            self._gen_log_msg(f"✓ {prov_label} balas {len(scenes)} scene.")
 
-            # 2) Map images to scenes per mode
-            needs = ffgen.MODES[params["mode"]]["needs"]
-            if "model" in needs and params["model_imgs"]:
-                primary = params["model_imgs"]
-            elif params["product_imgs"]:
-                primary = params["product_imgs"]
+            # 2) For EACH scene, generate a composited model+product still via
+            #    Grok Imagine (image mode). This is what makes Scene_1/image.png
+            #    and Scene_2/image.png different and matched to their action —
+            #    just like the reference Toner_MS_Glow pack. Falls back to the
+            #    raw uploaded photo only if a scene's generation fails.
+            mode = params["mode"]
+            needs = ffgen.MODES[mode]["needs"]
+            model_imgs = list(params.get("model_imgs") or [])
+            product_imgs = list(params.get("product_imgs") or [])
+
+            # Reference photos attached to every scene-image generation.
+            scene_refs: list = []
+            if "model" in needs:
+                scene_refs += model_imgs
+            if "product" in needs:
+                scene_refs += product_imgs
+            seen = set()
+            scene_refs = [p for p in scene_refs
+                          if not (p in seen or seen.add(p))][:4]
+
+            # Raw fallback if Imagine fails for a scene.
+            if "model" in needs and model_imgs:
+                raw_fallback = model_imgs
+            elif product_imgs:
+                raw_fallback = product_imgs
             else:
-                primary = params["model_imgs"]
+                raw_fallback = model_imgs or product_imgs
+
+            prod_name = script.get("product_name", "") or ""
+            grok = self._ensure_bridge_for("grok")
+            img_opts = {
+                "mode": "image",
+                "resolution": params.get("video_resolution", "720p"),
+                "duration": "6s",
+                "aspect": params["aspect"],
+            }
+
+            scene_dir = MEDIA_DIR / "generated" / "scene_stills"
+            scene_dir.mkdir(parents=True, exist_ok=True)
 
             scene_images: dict[int, Path] = {}
-            for i in range(1, len(scenes) + 1):
-                scene_images[i] = primary[(i - 1) % len(primary)]
+            for idx, s in enumerate(scenes, start=1):
+                if self._batch_cancel.is_set():
+                    self._gen_log_msg("🛑 Dibatalkan saat membuat gambar scene.")
+                    return
+                self._gen_log_msg(
+                    f"🖼  Membuat gambar Scene {idx} (model+produk digabung)...")
+                img_prompt = ffgen.build_scene_image_prompt(
+                    mode=mode,
+                    scene_action=str(s.get("action", "")),
+                    spoken=str(s.get("spoken", "")),
+                    background=params["background"],
+                    aspect=params["aspect"],
+                    product_name=prod_name,
+                )
+                try:
+                    r = grok.chat("grok", img_prompt, label="default",
+                                  timeout=300, force_new_chat=True,
+                                  attachments=scene_refs, imagine_opts=img_opts)
+                    media = (r.get("media") or []) if r.get("ok") else []
+                    saved = None
+                    for mobj in media:
+                        if mobj.get("type") == "image" and mobj.get("local_path"):
+                            lp = Path(mobj["local_path"])
+                            if lp.exists():
+                                saved = scene_dir / f"{params['project_name']}_scene{idx}.png"
+                                shutil.copy(lp, saved)
+                                break
+                    if saved:
+                        scene_images[idx] = saved
+                        self._gen_log_msg(f"   ✓ Gambar Scene {idx} siap.")
+                    else:
+                        raise RuntimeError("Imagine tidak mengembalikan gambar.")
+                except Exception as e:
+                    self._gen_log_msg(
+                        f"   ⚠ Gagal generate gambar Scene {idx} ({e}). "
+                        "Pakai foto upload mentah sebagai cadangan.")
+                    if raw_fallback:
+                        scene_images[idx] = raw_fallback[(idx - 1) % len(raw_fallback)]
 
             # 3) Assemble the zip
             out_dir = MEDIA_DIR / "generated"
@@ -764,35 +891,50 @@ class AIChatBridgeApp:
                 self._gen_log_msg("ℹ Auto-chain mati. Buka tab Chat → Batch ZIP untuk lanjut ke Grok.")
                 return
 
-            # 4) Auto-chain into Grok batch video
-            self._gen_log_msg("⚡ Lanjut ke Grok Imagine (batch video)...")
+            # 4) Auto-chain into Grok batch (image or video)
+            out_mode = params.get("output_mode", "video")
+            self._gen_log_msg(f"⚡ Lanjut ke Grok Imagine (batch {out_mode})...")
             self.root.after(0, lambda: self._gen_run_grok_batch(
                 zip_path, params["aspect"],
                 params.get("video_duration", "6s"),
-                params.get("video_resolution", "720p")))
+                params.get("video_resolution", "720p"),
+                out_mode))
 
         except Exception as e:
             self._gen_log_msg(f"✗ Error: {e}")
         finally:
-            if not params.get("autochain"):
+            # Re-enable the UI if we're not auto-chaining into the Grok batch
+            # (that path unlocks itself), OR if the run was cancelled — in which
+            # case no batch will start and the buttons must be restored here.
+            if self._batch_cancel.is_set():
+                self._gen_log_msg("🛑 Dibatalkan.")
+                self.root.after(0, self._gen_unlock)
+            elif not params.get("autochain"):
                 self.root.after(0, self._gen_unlock)
 
     def _gen_run_grok_batch(self, zip_path: Path, aspect: str,
-                            duration: str = "6s", resolution: str = "720p"):
+                            duration: str = "6s", resolution: str = "720p",
+                            output_mode: str = "video"):
         """Feed the freshly-built zip into the existing Grok batch pipeline."""
         try:
-            # Configure Imagine for video + chosen aspect/duration/resolution.
+            # Configure Imagine for the chosen output + aspect/duration/resolution.
             self.imagine_enabled_var.set(True)
             self._on_imagine_toggle()
-            self.imagine_mode_var.set("video")
+            self.imagine_mode_var.set(output_mode)  # "image" or "video"
             self._on_imagine_mode_changed()
             self.imagine_aspect_var.set(aspect)
             self.imagine_dur_var.set(duration)
             self.imagine_res_var.set(resolution)
-            self.chat_platform_var.set("grok")
-            self._gen_log_msg(
-                f"→ Video: durasi {duration}, resolusi {resolution}. "
-                "Memakai pipeline Batch ZIP di tab Chat.")
+            if hasattr(self, "chat_platform_var"):
+                self.chat_platform_var.set("grok")
+            if output_mode == "video":
+                self._gen_log_msg(
+                    f"→ Video: durasi {duration}, resolusi {resolution}. "
+                    "Memakai pipeline Batch ZIP di tab Chat.")
+            else:
+                self._gen_log_msg(
+                    f"→ Image: resolusi {resolution}, aspect {aspect}. "
+                    "Memakai pipeline Batch ZIP di tab Chat.")
             self._batch_zip_from_path(zip_path)
         except Exception as e:
             self._gen_log_msg(f"✗ Gagal mulai batch Grok: {e}")
@@ -801,8 +943,38 @@ class AIChatBridgeApp:
 
     def _gen_unlock(self):
         self._gen_busy = False
-        self.gen_run_btn.configure(state="normal",
-                                   text="🚀  GENERATE  (ChatGPT → ZIP → Grok)")
+        self.gen_run_btn.configure(state="normal")
+        if getattr(self, "gen_cancel_btn", None) is not None:
+            self.gen_cancel_btn.configure(state="disabled")
+        # Restore label reflecting the current output mode.
+        try:
+            self._gen_on_output_change()
+        except Exception:
+            self.gen_run_btn.configure(
+                text="🚀  GENERATE  (Script → ZIP → Grok)")
+
+    def _gen_cancel(self):
+        """Abort the running generator.
+
+        Signals the batch-cancel event (checked between scenes) AND closes the
+        active Grok browser session so a stuck typing/click call returns
+        immediately instead of hanging until timeout. This lets the user
+        cancel without restarting the whole program.
+        """
+        self._batch_cancel.set()
+        self._gen_log_msg("🛑 Membatalkan... (menutup sesi yang macet)")
+        if getattr(self, "gen_cancel_btn", None) is not None:
+            self.gen_cancel_btn.configure(state="disabled")
+
+        # Tear down any in-flight bridge session off the UI thread so a hung
+        # Playwright call (e.g. the 30s click timeout) is interrupted promptly.
+        def _kill():
+            for prov in ("grok", "chatgpt", "aistudio"):
+                try:
+                    self._teardown_bridge_for(prov)
+                except Exception:
+                    pass
+        threading.Thread(target=_kill, daemon=True).start()
 
     def _build_chat_tab(self, parent):
         """Build Chat tab with two sub-tabs: ChatGPT and Grok (run simultaneously)."""
@@ -825,51 +997,15 @@ class AIChatBridgeApp:
         ttk.Label(opts_bar, text="(Both browsers run simultaneously)",
                   foreground="#888", font=("Segoe UI", 9, "italic")).pack(side="left")
 
-        # Imagine options (Grok-only, shown when enabled)
+        # Imagine state vars (the actual widgets are built inside the Grok
+        # panel by _build_imagine_panel so they share the same parent and can
+        # be shown/hidden reliably).
         self.imagine_enabled_var = tk.BooleanVar(value=False)
-        self.imagine_frame = ttk.Frame(parent)
-        self.imagine_opts_frame = ttk.Frame(self.imagine_frame)
-        self.imagine_opts_frame.pack(fill="x")
-        ttk.Label(self.imagine_opts_frame, text="Mode:").pack(side="left", padx=(0, 4))
         self.imagine_mode_var = tk.StringVar(value="image")
-        mode_combo = ttk.Combobox(self.imagine_opts_frame, textvariable=self.imagine_mode_var,
-                                   values=["image", "video"], width=7, state="readonly")
-        mode_combo.pack(side="left", padx=(0, 10))
-        mode_combo.bind("<<ComboboxSelected>>", lambda e: self._on_imagine_mode_changed())
-        ttk.Label(self.imagine_opts_frame, text="Aspect:").pack(side="left", padx=(0, 4))
         self.imagine_aspect_var = tk.StringVar(value="9:16")
-        aspect_combo = ttk.Combobox(self.imagine_opts_frame, textvariable=self.imagine_aspect_var,
-                                     values=["2:3 (Tall)", "3:2 (Wide)", "1:1 (Square)",
-                                             "9:16 (Vertical)", "16:9 (Widescreen)"],
-                                     width=14, state="readonly")
-        aspect_combo.pack(side="left", padx=(0, 10))
-        aspect_combo.set("9:16 (Vertical)")
-        ttk.Label(self.imagine_opts_frame, text="Quality:").pack(side="left", padx=(0, 4))
         self.imagine_res_var = tk.StringVar(value="720p")
-        ttk.Radiobutton(self.imagine_opts_frame, text="Speed",
-                        variable=self.imagine_res_var, value="480p").pack(side="left", padx=(0, 2))
-        ttk.Radiobutton(self.imagine_opts_frame, text="Quality",
-                        variable=self.imagine_res_var, value="720p").pack(side="left", padx=(0, 10))
-        # ---- Duration (video only) — visible inline again ----
         self.imagine_dur_var = tk.StringVar(value="6s")
-        self.imagine_dur_label = ttk.Label(self.imagine_opts_frame, text="Durasi:")
-        self.imagine_dur_label.pack(side="left", padx=(0, 4))
-        self.imagine_dur_6 = ttk.Radiobutton(
-            self.imagine_opts_frame, text="6s",
-            variable=self.imagine_dur_var, value="6s")
-        self.imagine_dur_6.pack(side="left", padx=(0, 2))
-        self.imagine_dur_10 = ttk.Radiobutton(
-            self.imagine_opts_frame, text="10s",
-            variable=self.imagine_dur_var, value="10s")
-        self.imagine_dur_10.pack(side="left", padx=(0, 10))
-        # Legacy frame holders kept for compatibility (no longer used for layout)
-        self.imagine_quality_row = ttk.Frame(self.imagine_opts_frame)
-        self.imagine_video_row = ttk.Frame(self.imagine_opts_frame)
-        # Duration widgets start hidden; _on_imagine_mode_changed will show them for video
-        self.imagine_dur_label.pack_forget()
-        self.imagine_dur_6.pack_forget()
-        self.imagine_dur_10.pack_forget()
-        self._on_imagine_mode_changed()
+        self.imagine_frame = None  # built later, inside grok panel
 
         # Sub-notebook: one tab per platform
         self.chat_platform_notebook = ttk.Notebook(parent)
@@ -891,6 +1027,7 @@ class AIChatBridgeApp:
         self.chat_input = self._platform_panels["grok"]["input"]
         self.send_btn = self._platform_panels["grok"]["send_btn"]
         self.batch_btn = self._platform_panels["grok"]["batch_btn"]
+        self.cancel_btn = self._platform_panels["grok"]["cancel_btn"]
         self.attach_list_frame = self._platform_panels["grok"]["attach_list_frame"]
         self.chat_display = self._platform_panels["grok"]["display"]
         self.chat_status_var = self._platform_panels["grok"]["status_var"]
@@ -955,6 +1092,11 @@ class AIChatBridgeApp:
         ttk.Button(ctrl, text="Clear",
                    command=lambda p=pk: self._clear_chat_display_for(p)).pack(side="right", padx=(4, 0))
 
+        # Imagine options panel — built here (inside Grok's pane) so it shares
+        # a parent with the chat area and can be shown/hidden reliably.
+        if pk == "grok":
+            self._build_imagine_panel(right)
+
         # Status
         status_var = tk.StringVar(value="● not started")
         status_lbl = ttk.Label(right, textvariable=status_var,
@@ -1013,6 +1155,9 @@ class AIChatBridgeApp:
         batch_btn = ttk.Button(input_frame, text="Batch ZIP",
                                 command=self._batch_zip)
         batch_btn.pack(side="left")
+        cancel_btn = ttk.Button(input_frame, text="✖ Cancel",
+                                command=self._cancel_batch, state="disabled")
+        cancel_btn.pack(side="left", padx=(4, 0))
 
         chat_input.bind("<Return>", lambda e, p=pk: self._send_chat_for(p))
 
@@ -1022,6 +1167,7 @@ class AIChatBridgeApp:
             "input": chat_input,
             "send_btn": send_btn,
             "batch_btn": batch_btn,
+            "cancel_btn": cancel_btn if pk == "grok" else None,
             "label_var": label_var,
             "status_var": status_var,
             "status_lbl": status_lbl,
@@ -1258,6 +1404,37 @@ class AIChatBridgeApp:
             self._enqueue_log(f"[{pk}] Display history error: {e}")
 
     # ---- Per-platform bridge controls ---------------------------------
+    def _teardown_bridge_for(self, pk: str):
+        """Abort and drop the BridgeWorker for a platform.
+
+        Used to interrupt a stuck or cancelled run. The bridge's browsers are
+        closed immediately (breaking any in-flight Playwright call), the worker
+        is shut down, and the slot is cleared so the next request spins up a
+        clean bridge instead of restarting the whole program.
+        """
+        bridge = self._bridges.get(pk)
+        if bridge is None:
+            return
+        try:
+            # Prefer the hard abort if available; fall back to close_all.
+            if hasattr(bridge, "abort"):
+                bridge.abort()
+            else:
+                try:
+                    bridge.close_all_sessions()
+                except Exception:
+                    pass
+                try:
+                    bridge.shutdown(wait=False)
+                except Exception:
+                    pass
+        finally:
+            self._bridges[pk] = None
+            try:
+                self._bridge_headless.pop(pk, None)
+            except Exception:
+                pass
+
     def _ensure_bridge_for(self, pk: str):
         """Get or create the BridgeWorker for a specific platform."""
         desired_headless = bool(self.chat_headless_var.get())
@@ -1398,10 +1575,13 @@ class AIChatBridgeApp:
         panel = self._platform_panels.get(pk, {})
         btn = panel.get("send_btn")
         batch = panel.get("batch_btn")
+        cancel = panel.get("cancel_btn")
         if btn:
             btn.configure(state="normal", text="Send")
         if batch:
             batch.configure(state="normal", text="Batch ZIP")
+        if cancel is not None:
+            cancel.configure(state="disabled")
 
     def _on_chat_result_for(self, pk: str, result: dict):
         panel = self._platform_panels.get(pk, {})
@@ -1488,18 +1668,79 @@ class AIChatBridgeApp:
     def _on_chat_target_changed(self):
         pass
 
+    def _build_imagine_panel(self, parent):
+        """Build the Grok Imagine options bar inside the Grok pane.
+
+        Layout: a thin separator + a row holding
+            Mode (image/video) · Aspect · Quality · Durasi (video only)
+        Parented to `parent` (the Grok right-pane) so show/hide via
+        pack/pack_forget is reliable. An invisible anchor frame marks the
+        slot just below the control row, so the panel always appears there.
+        """
+        # Anchor: a zero-height frame that fixes the insertion slot.
+        self.imagine_anchor = ttk.Frame(parent, height=0)
+        self.imagine_anchor.pack(fill="x")
+
+        self.imagine_frame = ttk.Labelframe(parent, text="  Grok Imagine  ",
+                                            padding=6)
+        # Not packed yet — shown by _on_imagine_toggle.
+
+        row = ttk.Frame(self.imagine_frame)
+        row.pack(fill="x")
+
+        ttk.Label(row, text="Mode:").pack(side="left", padx=(0, 4))
+        mode_combo = ttk.Combobox(row, textvariable=self.imagine_mode_var,
+                                   values=["image", "video"], width=7,
+                                   state="readonly")
+        mode_combo.set("image")
+        mode_combo.pack(side="left", padx=(0, 10))
+        mode_combo.bind("<<ComboboxSelected>>",
+                        lambda e: self._on_imagine_mode_changed())
+
+        ttk.Label(row, text="Aspect:").pack(side="left", padx=(0, 4))
+        aspect_combo = ttk.Combobox(
+            row, textvariable=self.imagine_aspect_var,
+            values=["2:3 (Tall)", "3:2 (Wide)", "1:1 (Square)",
+                    "9:16 (Vertical)", "16:9 (Widescreen)"],
+            width=14, state="readonly")
+        aspect_combo.set("9:16 (Vertical)")
+        aspect_combo.pack(side="left", padx=(0, 10))
+
+        ttk.Label(row, text="Quality:").pack(side="left", padx=(0, 4))
+        ttk.Radiobutton(row, text="Speed (480p)",
+                        variable=self.imagine_res_var,
+                        value="480p").pack(side="left", padx=(0, 2))
+        ttk.Radiobutton(row, text="Quality (720p)",
+                        variable=self.imagine_res_var,
+                        value="720p").pack(side="left", padx=(0, 10))
+
+        # Duration (video only)
+        self.imagine_dur_label = ttk.Label(row, text="Durasi:")
+        self.imagine_dur_6 = ttk.Radiobutton(row, text="6s",
+                                              variable=self.imagine_dur_var,
+                                              value="6s")
+        self.imagine_dur_10 = ttk.Radiobutton(row, text="10s",
+                                               variable=self.imagine_dur_var,
+                                               value="10s")
+        # Legacy holders kept for any external references
+        self.imagine_quality_row = ttk.Frame(row)
+        self.imagine_video_row = ttk.Frame(row)
+
+        # Start in image mode → duration hidden.
+        self._on_imagine_mode_changed()
+
     def _on_imagine_toggle(self):
-        """Show/hide Imagine options panel (Grok tab only)."""
-        grok_panel = self._platform_panels.get("grok", {})
-        display = grok_panel.get("display")
+        """Show/hide the Imagine options panel (Grok pane only)."""
+        if not getattr(self, "imagine_frame", None):
+            return
         if self.imagine_enabled_var.get():
-            # Show imagine frame before chat display inside grok panel
-            if display:
-                try:
-                    self.imagine_frame.pack(fill="x", pady=(0, 4),
-                                            before=display.master)
-                except Exception:
-                    self.imagine_frame.pack(fill="x", pady=(0, 4))
+            try:
+                self.imagine_frame.pack(fill="x", pady=(2, 4),
+                                        after=self.imagine_anchor)
+            except Exception:
+                self.imagine_frame.pack(fill="x", pady=(2, 4))
+            # Refresh duration visibility for the current mode.
+            self._on_imagine_mode_changed()
         else:
             self.imagine_frame.pack_forget()
 
@@ -2011,6 +2252,10 @@ class AIChatBridgeApp:
         self._chat_busy["grok"] = True
         self.send_btn.configure(state="disabled")
         self.batch_btn.configure(state="disabled", text="⏳ Batch...")
+        # Arm the Cancel button and clear any stale cancel signal.
+        self._batch_cancel.clear()
+        if self.cancel_btn is not None:
+            self.cancel_btn.configure(state="normal")
 
         self._append_chat_divider(
             f"═══ BATCH START: {len(scenes)} scenes from {Path(zip_path).name} ═══"
@@ -2024,7 +2269,13 @@ class AIChatBridgeApp:
 
         def batch_worker():
             results = []
+            cancelled = False
             for i, scene in enumerate(scenes):
+                if gui._batch_cancel.is_set():
+                    cancelled = True
+                    gui.root.after(0, gui._enqueue_log,
+                        "🛑 Batch dibatalkan oleh user.")
+                    break
                 scene_tag = f"Scene {scene['num']}"
                 gui.root.after(0, gui._append_chat_divider,
                     f"─── {scene_tag} ({i+1}/{len(scenes)}) ───")
@@ -2033,14 +2284,6 @@ class AIChatBridgeApp:
 
                 try:
                     bridge = gui._ensure_bridge()
-
-                    # Force new chat for each scene
-                    if i > 0:
-                        try:
-                            bridge.start_new_chat(platform, label)
-                            import time; time.sleep(2)
-                        except Exception:
-                            pass
 
                     result = bridge.chat(
                         platform, scene["prompt"],
@@ -2067,13 +2310,22 @@ class AIChatBridgeApp:
 
             # Done
             ok_count = sum(1 for r in results if r["result"].get("ok"))
+            tail = "DIBATALKAN" if cancelled else "DONE"
             gui.root.after(0, gui._append_chat_divider,
-                f"═══ BATCH DONE: {ok_count}/{len(scenes)} succeeded ═══")
+                f"═══ BATCH {tail}: {ok_count}/{len(scenes)} succeeded ═══")
             gui.root.after(0, gui._enqueue_log,
-                f"📦 Batch complete: {ok_count}/{len(scenes)} scenes succeeded")
+                f"📦 Batch {'dibatalkan' if cancelled else 'complete'}: "
+                f"{ok_count}/{len(scenes)} scenes succeeded")
             gui.root.after(0, gui._unlock_send_button)
 
         threading.Thread(target=batch_worker, daemon=True).start()
+
+    def _cancel_batch(self):
+        """Signal the running batch / generator to stop after the current scene."""
+        self._batch_cancel.set()
+        self._enqueue_log("🛑 Membatalkan... (menunggu scene berjalan selesai)")
+        if getattr(self, "cancel_btn", None) is not None:
+            self.cancel_btn.configure(state="disabled")
 
     def _append_chat_status(self, text: str):
         """Legacy shim — appends status to Grok display."""
