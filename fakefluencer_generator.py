@@ -25,15 +25,193 @@ Toner_MS_Glow pack did inconsistently.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import io
 import json
 import re
 import shutil
+import urllib.request
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 0. PRODUCT IMAGE ANALYSIS  — auto-read brand + size from label
+# ──────────────────────────────────────────────────────────────────────
+
+def extract_product_info_from_image(
+    product_image_path: str | Path,
+    *,
+    anthropic_api_key: str = "",
+) -> dict:
+    """Send the product photo to Claude Vision and extract brand + size.
+
+    Returns a dict:
+        {
+            "brand":       str,   # e.g. "MS Glow"          (empty if not found)
+            "name":        str,   # e.g. "White Cell DNA Toner"
+            "full_name":   str,   # "MS Glow White Cell DNA Toner"
+            "size_ml":     float | None,   # 50.0, 100.0, …  or None
+            "size_label":  str,   # "50 ml" / "100 ml" / "" (for display)
+            "source":      str,   # "vision" | "fallback"
+            "raw_response": str,  # full Claude reply for debugging
+        }
+
+    If the API call fails or the key is missing, returns a fallback dict
+    with empty strings and size_ml=None so callers can ask the user.
+
+    The caller must pass either the ANTHROPIC_API_KEY env variable or
+    supply it directly.  We do NOT import anthropic-sdk here so this
+    file stays dependency-free for environments that install only requests.
+    """
+    import os
+
+    api_key = anthropic_api_key or os.environ.get("ANTHROPIC_API_KEY", "")
+
+    _FALLBACK = {
+        "brand": "", "name": "", "full_name": "",
+        "size_ml": None, "size_label": "",
+        "source": "fallback", "raw_response": "",
+    }
+
+    if not api_key:
+        return {**_FALLBACK, "raw_response": "No API key provided."}
+
+    # Read + base64-encode the image
+    try:
+        img_path = Path(product_image_path)
+        ext = img_path.suffix.lower().lstrip(".")
+        mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg",
+                "png": "image/png", "webp": "image/webp"}.get(ext, "image/jpeg")
+        img_b64 = base64.b64encode(img_path.read_bytes()).decode()
+    except Exception as exc:
+        return {**_FALLBACK, "raw_response": f"Image read error: {exc}"}
+
+    payload = {
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 256,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": mime, "data": img_b64},
+                },
+                {
+                    "type": "text",
+                    "text": (
+                        "Look at the product label in this image. "
+                        "Reply ONLY with a valid JSON object — no backticks, no commentary:\n"
+                        "{\n"
+                        '  "brand": "<brand / manufacturer name, e.g. MS Glow>",\n'
+                        '  "product_name": "<product line + variant, e.g. White Cell DNA Toner>",\n'
+                        '  "size_ml": <numeric ml value as a number, e.g. 50 — or null if not visible>\n'
+                        "}\n"
+                        "If you cannot read the brand, use empty string. "
+                        "If size is written as g/oz, convert to ml equivalent best you can "
+                        "or leave null. Do NOT include units in size_ml — numbers only."
+                    ),
+                },
+            ],
+        }],
+    }
+
+    try:
+        req = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=json.dumps(payload).encode(),
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read())
+        raw = data["content"][0]["text"].strip()
+    except Exception as exc:
+        return {**_FALLBACK, "raw_response": f"API error: {exc}"}
+
+    # Parse the JSON Claude returned
+    try:
+        cleaned = re.sub(r"```(?:json)?|```", "", raw).strip()
+        start, end = cleaned.find("{"), cleaned.rfind("}")
+        vision = json.loads(cleaned[start: end + 1])
+    except Exception:
+        return {**_FALLBACK, "raw_response": raw}
+
+    brand       = str(vision.get("brand") or "").strip()
+    prod_name   = str(vision.get("product_name") or "").strip()
+    size_raw    = vision.get("size_ml")
+    size_ml: Optional[float] = None
+    try:
+        if size_raw is not None:
+            size_ml = float(size_raw)
+    except (TypeError, ValueError):
+        pass
+
+    # Build full name: "MS Glow White Cell DNA Toner" or just product name
+    full_name = f"{brand} {prod_name}".strip() if brand else prod_name
+
+    size_label = f"{int(size_ml) if size_ml and size_ml == int(size_ml) else size_ml} ml" \
+                 if size_ml else ""
+
+    return {
+        "brand": brand,
+        "name": prod_name,
+        "full_name": full_name,
+        "size_ml": size_ml,
+        "size_label": size_label,
+        "source": "vision",
+        "raw_response": raw,
+    }
+
+
+# Size → realistic physical scale guidance for Grok Imagine
+# Keys are upper bounds in ml; the last entry is the catch-all.
+_SIZE_SCALE_MAP = [
+    (30,   "very small bottle about 3–4 cm tall, fits in a closed fist, "
+           "fingertips overlap behind it"),
+    (60,   "small travel-size bottle roughly the length of the model's palm "
+           "(≈9–10 cm), held in one hand with fingers and thumb wrapping around it "
+           "and fingertips nearly meeting"),
+    (120,  "medium bottle about 12–14 cm tall, one hand can hold it but the "
+           "fingers do not fully wrap around — thumb and index finger roughly "
+           "parallel"),
+    (250,  "standard bottle about 16–18 cm tall, comfortably held with one hand "
+           "but clearly larger than the palm"),
+    (500,  "large pump bottle about 20–22 cm tall, requires a firm one-hand grip "
+           "or is set on a surface"),
+    (9999, "big bottle, clearly larger than the hand, likely resting on a surface"),
+]
+
+
+def _scale_description(size_ml: Optional[float]) -> str:
+    """Return a plain-English scale sentence for the given volume."""
+    if size_ml is None:
+        # No size info — use a safe generic anchor
+        return (
+            "The product is a standard small cosmetic bottle. "
+            "Scale it so it fits naturally in one hand — the bottle height "
+            "should be roughly equal to the model's palm length. "
+            "Keep proportions realistic; do NOT make the bottle oversized."
+        )
+    for limit, description in _SIZE_SCALE_MAP:
+        if size_ml <= limit:
+            return (
+                f"This is a {int(size_ml) if size_ml == int(size_ml) else size_ml} ml product "
+                f"({description}). "
+                f"Scale the bottle accordingly — keep proportions realistic "
+                f"relative to the model's hand and face."
+            )
+    return (
+        f"This is a {size_ml} ml product (very large container). "
+        "Scale the bottle so it looks realistic relative to the model's hand."
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -150,6 +328,7 @@ def build_chatgpt_prompt(
     drift. ChatGPT must answer with strict JSON.
     """
     m = MODES.get(mode, MODES["ugc"])
+    needs = m["needs"]
     voice = VOICE_PROFILES.get(voice_key, VOICE_PROFILES["ayu_wanita"])
     tone = EMOTIONAL_TONES.get(tone_key, EMOTIONAL_TONES["antusias"])
 
@@ -163,23 +342,47 @@ def build_chatgpt_prompt(
     ]
     if product_name:
         role_lines.append(f"Product being featured: {product_name}.")
+    if "product" in needs:
+        role_lines.append(
+            "IMPORTANT: a product photo is attached. Read the brand, the "
+            "product name/variant, and the size in ml DIRECTLY off the label "
+            "in that photo, and report them in the JSON fields brand / "
+            "product_name / size_ml. If a value is not legible, use an empty "
+            "string (or null for size_ml) — do not guess.")
     if extra_notes:
         role_lines.append(f"Extra direction: {extra_notes}")
+
+    # Structure guidance MUST match the requested scene count. The old text
+    # always demanded "Scene 1 = HOOK, last = CTA", which implicitly forced a
+    # 3-beat ad even when num_scenes==1 — so the model returned 3 scenes.
+    if num_scenes <= 1:
+        structure_clause = (
+            "Produce EXACTLY 1 scene object — a single, self-contained scene "
+            'with role "CTA" that hooks, shows the product, and ends with a '
+            "call to action in one short beat. Do NOT split it into multiple "
+            "scenes under any circumstances; the scenes array must have length 1."
+        )
+    else:
+        structure_clause = (
+            f"Produce EXACTLY {num_scenes} scene objects — no more, no fewer. "
+            "Scene 1 role must be HOOK; the final scene role must be CTA; "
+            "any middle scenes are BODY."
+        )
 
     schema = (
         "Reply with ONE valid JSON object and NOTHING else — no markdown, "
         "no backticks, no commentary. Schema:\n"
         "{\n"
-        '  "product_name": "<short product name in Indonesian>",\n'
+        '  "brand": "<brand/manufacturer on the product label, e.g. MS Glow; \\"\\" if none/illegible>",\n'
+        '  "product_name": "<product line + variant in Indonesian, e.g. White Cell DNA Toner>",\n'
+        '  "size_ml": <numeric ml from the label as a number, e.g. 50 — or null if not visible>,\n'
         '  "scenes": [\n'
         '    { "role": "HOOK|BODY|CTA",\n'
         '      "spoken": "<the exact words the model says, in casual Indonesian>",\n'
         '      "action": "<one short line describing what is shown on screen>" }\n'
         "  ]\n"
         "}\n"
-        f"Produce EXACTLY {num_scenes} scene object(s). "
-        "Scene 1 role must be HOOK; the final scene role must be CTA; "
-        "any middle scenes are BODY. "
+        + structure_clause + " "
         "Each 'spoken' line must be 1-2 sentences, natural spoken Indonesian, "
         "and must be consistent in personality with the same single speaker. "
         "Do not include emojis. Do not include the brand more than necessary."
@@ -196,6 +399,7 @@ def build_scene_image_prompt(
     background: str,
     aspect: str,
     product_name: str = "",
+    product_size_ml: Optional[float] = None,
 ) -> str:
     """Prompt for Grok Imagine (IMAGE mode) that composes ONE still per scene.
 
@@ -204,6 +408,13 @@ def build_scene_image_prompt(
     photoreal frame that matches the scene's on-screen action. That merged
     still is what each Scene_N/image.png should contain (like the original
     Toner_MS_Glow pack, where every scene has a distinct composited image).
+
+    product_name    — full "Brand + Product" string, e.g. "MS Glow White Cell
+                      DNA Toner". Set automatically from extract_product_info_from_image()
+                      or entered manually by the user.
+    product_size_ml — actual volume in ml (e.g. 50.0, 100.0). Used to generate
+                      realistic scale guidance via _scale_description(). If None,
+                      a safe generic anchor is used.
     """
     m = MODES.get(mode, MODES["ugc"])
     needs = m["needs"]
@@ -218,26 +429,19 @@ def build_scene_image_prompt(
 
     prod = f" The product is {product_name}." if product_name else ""
 
-    # Scale guidance: without this the model tends to render the product
-    # far too large relative to the hand/face. Anchor it to a small,
-    # one-hand-held bottle and add negatives for oversized renders.
+    # Scale guidance — dynamically built from actual ml size.
+    # _scale_description() maps volume → physical hand/face anchor so every
+    # product (50 ml travel toner, 100 ml serum, 250 ml shampoo …) gets the
+    # right proportions instead of a hardcoded "50 ml" anchor.
     scale_clause = ""
     if "product" in needs:
-        scale_clause = (
-            " IMPORTANT product scale: this is a small travel-size bottle "
-            "(about 50 ml), roughly the length of the model's palm. It must "
-            "be held comfortably in ONE hand with the fingers and thumb "
-            "wrapping naturally around it, fingertips nearly meeting. The "
-            "bottle height should be about half the length of her face. Keep "
-            "the proportions realistic for a small cosmetic bottle — never "
-            "oversized."
-        )
+        scale_clause = " IMPORTANT product scale: " + _scale_description(product_size_ml)
 
     negatives = "no on-screen captions, no watermark, no extra people"
     if "product" in needs:
         negatives += (
-            ", no oversized or giant bottle, bottle not larger than the hand, "
-            "no distorted or unrealistic product scale"
+            ", no oversized or giant bottle, bottle not larger than realistic "
+            "for its volume, no distorted or unrealistic product scale"
         )
 
     return (

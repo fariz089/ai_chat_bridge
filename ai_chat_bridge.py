@@ -81,10 +81,11 @@ def save_config(cfg: dict):
 
 
 class AIChatBridgeApp:
-    PLATFORM_DISPLAY = {"chatgpt": "ChatGPT", "grok": "Grok"}
+    PLATFORM_DISPLAY = {"chatgpt": "ChatGPT", "grok": "Grok", "gemini": "Gemini"}
     PLATFORM_NOTES = {
         "chatgpt": "Login ke chatgpt.com → session cookie disimpan → bisa chat via API.",
         "grok": "Login ke grok.com (pakai akun X/Twitter) → session cookie disimpan → bisa chat via API.",
+        "gemini": "Login ke gemini.google.com (akun Google) via Chrome CDP → bisa chat via API.",
     }
     REQUIRED_COOKIES_BY_PLATFORM = {
         "chatgpt": ("__Secure-next-auth.session-token",),
@@ -491,10 +492,11 @@ class AIChatBridgeApp:
 
         # ── Provider pemilih: ChatGPT, Grok, atau AI Studio ──
         ttk.Label(opt, text="Provider skrip:").grid(row=4, column=0, sticky="w", padx=4, pady=3)
-        self._gen_provider_keys = ["chatgpt", "grok", "aistudio"]
+        self._gen_provider_keys = ["chatgpt", "grok", "gemini", "aistudio"]
         self._gen_provider_labels = {
             "chatgpt":   "ChatGPT",
             "grok":      "Grok",
+            "gemini":    "Gemini (web)",
             "aistudio":  "AI Studio (Fakefluencer)",
         }
         self.gen_provider_var = tk.StringVar(value="ChatGPT")
@@ -507,6 +509,21 @@ class AIChatBridgeApp:
         ttk.Label(opt, text="(pilih Grok / AI Studio bila kuota ChatGPT habis)",
                   style="Dim.TLabel").grid(row=4, column=2, columnspan=2,
                                            sticky="w", padx=4, pady=3)
+
+        # ── Provider GAMBAR: Grok Imagine atau Gemini (Nano Banana) ──
+        ttk.Label(opt, text="Provider gambar:").grid(row=7, column=0, sticky="w", padx=4, pady=3)
+        self._gen_img_provider_keys = ["grok", "gemini"]
+        self._gen_img_provider_labels = {
+            "grok":   "Grok Imagine",
+            "gemini": "Gemini (web — langganan Pro)",
+        }
+        self.gen_img_provider_combo = ttk.Combobox(
+            opt,
+            values=[self._gen_img_provider_labels[k] for k in self._gen_img_provider_keys],
+            width=30, state="readonly")
+        self.gen_img_provider_combo.current(0)
+        self.gen_img_provider_combo.grid(row=7, column=1, columnspan=2,
+                                         sticky="w", padx=4, pady=3)
 
         # ── Output: image atau video (Grok Imagine mode) ──
         ttk.Label(opt, text="Output:").grid(row=6, column=0, sticky="w", padx=4, pady=3)
@@ -681,6 +698,117 @@ class AIChatBridgeApp:
         self.gen_model_lbl.configure(text=f"{len(self.gen_model_imgs)} foto")
         self.gen_product_lbl.configure(text=f"{len(self.gen_product_imgs)} foto")
 
+    def _gen_confirm_product_blocking(self, prefill: dict):
+        """Open the product-confirm dialog from a worker thread and wait for
+        the user's answer. Tk must be touched only on the main thread, so we
+        schedule the dialog there and block this thread on an Event."""
+        holder = {"value": None}
+        done = threading.Event()
+
+        def _open():
+            try:
+                holder["value"] = self._gen_confirm_product(prefill=prefill)
+            finally:
+                done.set()
+
+        self.root.after(0, _open)
+        done.wait()
+        return holder["value"]
+
+    def _gen_confirm_product(self, prefill: dict | None = None):
+        """Modal dialog: confirm/edit brand, product+variant, and size (ml)
+        before drawing. The fields are pre-filled from what the script provider
+        (Grok / ChatGPT / Gemini) already read off the attached product photo —
+        no separate vision API is needed. Everything stays editable.
+        Returns {brand, name, full_name, size_ml} on OK, or None if cancelled.
+        """
+        prefill = prefill or {}
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Konfirmasi Produk")
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.resizable(False, False)
+
+        result = {"value": None}
+
+        frm = ttk.Frame(dlg, padding=14)
+        frm.pack(fill="both", expand=True)
+
+        ttk.Label(frm, text="Cek dulu detail produk sebelum bikin gambar.\n"
+                            "Edit kalau ada yang salah.",
+                  justify="left").grid(row=0, column=0, columnspan=2,
+                                       sticky="w", pady=(0, 10))
+
+        ttk.Label(frm, text="Merek:").grid(row=1, column=0, sticky="w", pady=3)
+        brand_var = tk.StringVar(value=str(prefill.get("brand", "") or ""))
+        ttk.Entry(frm, textvariable=brand_var, width=34).grid(
+            row=1, column=1, sticky="we", pady=3)
+
+        ttk.Label(frm, text="Produk / varian:").grid(row=2, column=0, sticky="w", pady=3)
+        name_var = tk.StringVar(value=str(prefill.get("name", "") or ""))
+        ttk.Entry(frm, textvariable=name_var, width=34).grid(
+            row=2, column=1, sticky="we", pady=3)
+
+        ttk.Label(frm, text="Ukuran (ml):").grid(row=3, column=0, sticky="w", pady=3)
+        _sm = prefill.get("size_ml")
+        size_var = tk.StringVar(
+            value=("" if _sm in (None, "") else
+                   str(int(_sm) if float(_sm) == int(_sm) else _sm)))
+        ttk.Entry(frm, textvariable=size_var, width=12).grid(
+            row=3, column=1, sticky="w", pady=3)
+
+        by = prefill.get("by", "")
+        if str(prefill.get("brand", "")).strip() or str(prefill.get("name", "")).strip():
+            note = f"Terdeteksi otomatis dari foto oleh {by}. Edit bila perlu." \
+                   if by else "Terdeteksi otomatis dari foto. Edit bila perlu."
+        else:
+            note = "Tidak terbaca dari foto — isi manual."
+        ttk.Label(frm, text=note, style="Dim.TLabel",
+                  font=("Segoe UI", 9, "italic")).grid(
+            row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        def _parse_size():
+            raw = (size_var.get() or "").strip().lower().replace("ml", "").strip()
+            if not raw:
+                return None
+            try:
+                return float(raw.replace(",", "."))
+            except ValueError:
+                return None
+
+        def _ok():
+            brand = brand_var.get().strip()
+            name = name_var.get().strip()
+            full = (f"{brand} {name}".strip() if brand else name).strip()
+            result["value"] = {
+                "brand": brand, "name": name, "full_name": full,
+                "size_ml": _parse_size(),
+            }
+            dlg.destroy()
+
+        def _cancel():
+            result["value"] = None
+            dlg.destroy()
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=5, column=0, columnspan=2, sticky="we", pady=(14, 0))
+        ttk.Button(btns, text="Batal", command=_cancel).pack(side="right")
+        ttk.Button(btns, text="✓ Lanjut Generate", style="Accent.TButton",
+                   command=_ok).pack(side="right", padx=6)
+
+        dlg.protocol("WM_DELETE_WINDOW", _cancel)
+
+        dlg.update_idletasks()
+        try:
+            x = self.root.winfo_rootx() + (self.root.winfo_width() - dlg.winfo_width()) // 2
+            y = self.root.winfo_rooty() + (self.root.winfo_height() - dlg.winfo_height()) // 3
+            dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
+        except Exception:
+            pass
+
+        self.root.wait_window(dlg)
+        return result["value"]
+
     def _gen_run(self):
         if self._gen_busy:
             self._gen_log_msg("⚠ Masih ada proses berjalan.")
@@ -707,10 +835,18 @@ class AIChatBridgeApp:
         except Exception:
             provider = "chatgpt"
 
+        # Which engine draws the scene stills: Grok Imagine or Gemini.
+        try:
+            ip_idx = self.gen_img_provider_combo.current()
+            img_provider = self._gen_img_provider_keys[ip_idx if ip_idx >= 0 else 0]
+        except Exception:
+            img_provider = "grok"
+
         params = {
             "mode": mode,
             "num_scenes": num_scenes,
             "provider": provider,
+            "img_provider": img_provider,
             "output_mode": self.gen_output_var.get(),  # "image" | "video"
             # Video options applied when batching to Grok Imagine
             "video_duration": "10s" if self.gen_vdur_var.get().startswith("10") else "6s",
@@ -750,6 +886,7 @@ class AIChatBridgeApp:
             )
             provider = params.get("provider", "chatgpt")
             prov_label = {"chatgpt": "ChatGPT", "grok": "Grok",
+                          "gemini": "Gemini (web)",
                           "aistudio": "AI Studio"}.get(provider, provider)
             self._gen_log_msg(f"📝 Mengirim brief ke {prov_label}...")
 
@@ -784,12 +921,44 @@ class AIChatBridgeApp:
             try:
                 script = ffgen.parse_script_json(reply)
             except Exception as e:
-                self._gen_log_msg(f"✗ Gagal baca skrip JSON dari ChatGPT: {e}")
+                self._gen_log_msg(f"✗ Gagal baca skrip JSON dari {prov_label}: {e}")
                 self._gen_log_msg("   Balasan mentah:\n" + reply[:600])
                 return
 
             scenes = script["scenes"]
-            self._gen_log_msg(f"✓ {prov_label} balas {len(scenes)} scene.")
+            want = int(params.get("num_scenes", len(scenes)) or len(scenes))
+            if len(scenes) > want:
+                self._gen_log_msg(
+                    f"ℹ {prov_label} balas {len(scenes)} scene — dipangkas ke {want} "
+                    "sesuai 'Jumlah scene' yang kamu pilih.")
+                scenes = scenes[:want]
+                script["scenes"] = scenes  # so the ZIP also gets the right count
+            elif len(scenes) < want:
+                self._gen_log_msg(
+                    f"⚠ {prov_label} cuma balas {len(scenes)} scene padahal kamu minta {want}. "
+                    "Lanjut dengan yang ada.")
+            self._gen_log_msg(f"✓ {len(scenes)} scene siap diproses.")
+
+            # 1b) Confirm brand / product / size with the user BEFORE drawing.
+            #     These were read off the attached product photo by the script
+            #     provider itself — no separate Claude/vision key needed.
+            mode_needs = ffgen.MODES[params["mode"]]["needs"]
+            confirmed_name = ""
+            confirmed_size = None
+            if "product" in mode_needs and params.get("product_imgs"):
+                prefill = {
+                    "brand": str(script.get("brand", "") or ""),
+                    "name": str(script.get("product_name", "") or ""),
+                    "size_ml": script.get("size_ml"),
+                    "by": prov_label,
+                }
+                confirmed = self._gen_confirm_product_blocking(prefill)
+                if confirmed is None:
+                    self._gen_log_msg("ℹ Generate dibatalkan di konfirmasi produk.")
+                    self._batch_cancel.set()
+                    return
+                confirmed_name = confirmed.get("full_name", "")
+                confirmed_size = confirmed.get("size_ml")
 
             # 2) For EACH scene, generate a composited model+product still via
             #    Grok Imagine (image mode). This is what makes Scene_1/image.png
@@ -819,8 +988,20 @@ class AIChatBridgeApp:
             else:
                 raw_fallback = model_imgs or product_imgs
 
-            prod_name = script.get("product_name", "") or ""
-            grok = self._ensure_bridge_for("grok")
+            # Product identity for the image prompt: the values the user just
+            # confirmed; fall back to the script's product name if blank.
+            prod_name = (confirmed_name or "").strip() \
+                or (script.get("product_name", "") or "")
+            prod_size_ml = confirmed_size
+
+            img_provider = params.get("img_provider", "grok")
+            img_prov_label = {"grok": "Grok Imagine",
+                              "gemini": "Gemini (web)"}.get(
+                                  img_provider, img_provider)
+            self._gen_log_msg(f"🎨 Pembuat gambar: {img_prov_label}")
+
+            img_bridge = self._ensure_bridge_for(
+                "gemini" if img_provider == "gemini" else "grok")
             img_opts = {
                 "mode": "image",
                 "resolution": params.get("video_resolution", "720p"),
@@ -837,7 +1018,8 @@ class AIChatBridgeApp:
                     self._gen_log_msg("🛑 Dibatalkan saat membuat gambar scene.")
                     return
                 self._gen_log_msg(
-                    f"🖼  Membuat gambar Scene {idx} (model+produk digabung)...")
+                    f"🖼  Membuat gambar Scene {idx} via {img_prov_label} "
+                    "(model+produk digabung)...")
                 img_prompt = ffgen.build_scene_image_prompt(
                     mode=mode,
                     scene_action=str(s.get("action", "")),
@@ -845,11 +1027,22 @@ class AIChatBridgeApp:
                     background=params["background"],
                     aspect=params["aspect"],
                     product_name=prod_name,
+                    product_size_ml=prod_size_ml,
                 )
                 try:
-                    r = grok.chat("grok", img_prompt, label="default",
-                                  timeout=300, force_new_chat=True,
-                                  attachments=scene_refs, imagine_opts=img_opts)
+                    if img_provider == "gemini":
+                        # Gemini WEB path (gemini.google.com, the user's Pro
+                        # login). The same chat method harvests + downloads the
+                        # generated image (see _chat_gemini in chat_engine.py).
+                        r = img_bridge.chat("gemini", img_prompt,
+                                            label="default", timeout=300,
+                                            force_new_chat=True,
+                                            attachments=scene_refs)
+                    else:
+                        r = img_bridge.chat("grok", img_prompt, label="default",
+                                            timeout=300, force_new_chat=True,
+                                            attachments=scene_refs,
+                                            imagine_opts=img_opts)
                     media = (r.get("media") or []) if r.get("ok") else []
                     saved = None
                     for mobj in media:
@@ -1013,8 +1206,9 @@ class AIChatBridgeApp:
 
         self._platform_panels = {}
         platform_configs = [
-            ("chatgpt", "🟢 ChatGPT", "#10a37f"),
-            ("grok",    "⚡ Grok",    "#1d9bf0"),
+            ("chatgpt", "🟢 ChatGPT",  "#10a37f"),
+            ("grok",    "⚡ Grok",     "#1d9bf0"),
+            ("gemini",  "✦ Gemini",   "#8ab4f8"),
         ]
         for pk, tab_label, accent in platform_configs:
             pf = ttk.Frame(self.chat_platform_notebook, padding=6)
@@ -1268,6 +1462,64 @@ class AIChatBridgeApp:
                     convs = data.get("conversations", data.get("items", []))
                     chats = [{"id": c.get("conversationId", c.get("id", "")),
                               "title": c.get("title", "Untitled")} for c in convs]
+                elif pk == "gemini":
+                    # Gemini has no public REST API — scrape from the live browser via CDP.
+                    bridge = self._bridges.get("gemini")
+                    if bridge is None:
+                        self.root.after(0, self._set_recent_error, pk, listbox,
+                                        "Buka Gemini browser dulu (kirim pesan apapun), lalu Refresh")
+                        return
+                    try:
+                        chats_raw = bridge._pool._sessions.get("gemini", {})
+                        # Use the first available session
+                        session = None
+                        for s in bridge._pool._sessions.values() if hasattr(bridge, "_pool") else []:
+                            if hasattr(s, "platform") and s.platform == "gemini":
+                                session = s
+                                break
+                        if session is None and hasattr(bridge, "_pool"):
+                            for key, s in bridge._pool._sessions.items():
+                                if "gemini" in str(key):
+                                    session = s
+                                    break
+                        if session is None:
+                            self.root.after(0, self._set_recent_error, pk, listbox,
+                                            "Buka Gemini browser dulu (kirim pesan apapun), lalu Refresh")
+                            return
+                        page = session._page
+                        if page is None:
+                            self.root.after(0, self._set_recent_error, pk, listbox,
+                                            "Browser Gemini belum terbuka")
+                            return
+                        # Scrape sidebar conversation links from the live page
+                        raw_chats = page.evaluate("""() => {
+                            const results = [];
+                            // Gemini sidebar: links with /app/<id> pattern
+                            const links = document.querySelectorAll('a[href*="/app/"]');
+                            const seen = new Set();
+                            links.forEach(a => {
+                                const href = a.getAttribute('href') || '';
+                                const match = href.match(/[/]app[/]([a-f0-9]+)/i);
+                                if (!match) return;
+                                const id = match[1];
+                                if (seen.has(id)) return;
+                                seen.add(id);
+                                const title = (a.innerText || a.textContent || '').trim()
+                                    .split('\n')[0].trim() || 'Untitled';
+                                results.push({id, title, url: 'https://gemini.google.com' + href});
+                            });
+                            return results.slice(0, 40);
+                        }""")
+                        chats = [{"id": c["id"], "title": c["title"], "url": c.get("url", "")}
+                                 for c in (raw_chats or [])]
+                        if not chats:
+                            self.root.after(0, self._set_recent_error, pk, listbox,
+                                            "Tidak ada chat ditemukan — pastikan Gemini sudah login & halaman terbuka")
+                            return
+                    except Exception as e:
+                        self.root.after(0, self._set_recent_error, pk, listbox,
+                                        f"Gagal scrape Gemini: {e}")
+                        return
                 else:
                     chats = []
 

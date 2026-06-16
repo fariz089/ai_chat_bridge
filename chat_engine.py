@@ -29,6 +29,7 @@ import logging
 import mimetypes
 import os
 import queue
+import re
 import threading
 import time
 from pathlib import Path
@@ -234,6 +235,7 @@ class ChatSession:
         return {
             "chatgpt": "https://chatgpt.com/",
             "grok": "https://grok.com/",
+            "gemini": "https://gemini.google.com/app",
             "aistudio": "https://ai.studio/apps/322b7da4-0861-4ffc-83e1-6e62054bdba1?fullscreenApplet=true",
         }.get(self.platform, "")
 
@@ -666,6 +668,8 @@ class ChatSession:
                 result = self._chat_chatgpt(message, timeout, resolved)
             elif self.platform == "aistudio":
                 result = self._chat_aistudio(message, timeout, resolved)
+            elif self.platform == "gemini":
+                result = self._chat_gemini(message, timeout, resolved)
             elif self.platform == "grok":
                 result = self._chat_grok(message, timeout, resolved)
             else:
@@ -1521,16 +1525,467 @@ class ChatSession:
             logger.error(f"[aistudio] No response. Debug: {debug}. URL: {self.current_url()}")
             raise TimeoutError("No response received from AI Studio within timeout")
 
-        # Extract any media that rendered (images the applet produced).
+        # Extract the image the applet produced (Gemini / Nano Banana output).
+        # Pick the single largest intrinsic-resolution image and download it so
+        # callers get a real local_path. The old code recorded every <img> src
+        # (icons/avatars included) and never downloaded, so nothing got saved.
         media: list[dict] = []
         try:
-            srcs = page.eval_on_selector_all(
-                "img",
-                "els => els.map(e => e.src).filter(s => s && s.startsWith('http'))")
-            for s in (srcs or [])[:12]:
-                media.append({"type": "image", "url": s})
+            best = page.evaluate("""() => {
+                let best = null;
+                document.querySelectorAll('img').forEach(img => {
+                    const src = img.src || '';
+                    if (!src || !src.startsWith('http')) return;
+                    const r = img.getBoundingClientRect();
+                    if (r.width < 200 || r.height < 200) return;
+                    const score = (img.naturalWidth||0) * (img.naturalHeight||0);
+                    if (!best || score > best.score) best = {src, score};
+                });
+                return best ? best.src : '';
+            }""")
+            if best:
+                local = self._download_to_media(best, ".png")
+                media.append({
+                    "type": "image", "url": best,
+                    "local_path": str(local) if local else "",
+                })
+        except Exception as e:
+            logger.warning(f"[aistudio] media harvest failed: {e}")
+
+        return {"text": last_text, "media": media}
+
+    # ------------------------------------------------------------------
+    # Gemini (web app — gemini.google.com, uses the user's Pro login)
+    # ------------------------------------------------------------------
+
+    def _chat_gemini(self, message: str, timeout: int,
+                     attachments: list[Path]) -> dict:
+        """Drive the Gemini web app like a human: attach (if any), type, send,
+        wait for the reply to settle, then harvest text AND any generated image.
+
+        This is the SAME method for both jobs:
+          * script step  -> the prompt asks for JSON, no image is produced
+          * image step   -> the prompt asks for a photoreal image, Gemini's
+                            built-in image generation ("Nano Banana") returns
+                            one, which we download.
+
+        NOTE: gemini.google.com's DOM is not public/stable. The selectors below
+        are best-effort and may need tweaking against the live UI; everything
+        degrades gracefully (logs + returns what it found) instead of crashing.
+        """
+        page = self._page
+
+        # Gemini's prompt box is a contenteditable rich-textarea.
+        input_sel = ('div[contenteditable="true"], rich-textarea div[contenteditable="true"], '
+                     'textarea')
+        page.wait_for_selector(input_sel, timeout=25_000)
+        page.wait_for_timeout(800)
+
+        # Dismiss the occasional "Got it" / ToS / cookie prompts.
+        for txt in ("Got it", "I agree", "Accept all", "No thanks", "Dismiss"):
+            try:
+                b = page.query_selector(f'button:has-text("{txt}")')
+                if b and b.is_visible():
+                    b.click()
+                    page.wait_for_timeout(300)
+            except Exception:
+                pass
+
+        if attachments:
+            try:
+                # Gemini uses the OS native file picker — NOT a hidden <input>.
+                # Playwright's expect_file_chooser() intercepts the OS dialog
+                # before it opens and feeds it our paths directly.
+                #
+                # Step 1: Find and click the "+" button.
+                plus_btn = None
+                for sel in (
+                    'button[aria-label*="Upload" i]',
+                    'button[aria-label*="Add" i]',
+                    'button[aria-label*="More" i]',
+                    'button[data-test-id*="plus" i]',
+                    # Last resort: first button whose text/content looks like "+"
+                    'button:has-text("+")',
+                ):
+                    try:
+                        el = page.query_selector(sel)
+                        if el and el.is_visible():
+                            plus_btn = el
+                            break
+                    except Exception:
+                        continue
+
+                if not plus_btn:
+                    # Try by position: the "+" is left of the Tools button
+                    plus_btn = page.evaluate_handle(
+                        """() => {
+                            const btns = [...document.querySelectorAll('button')];
+                            return btns.find(b =>
+                                (b.textContent || '').trim() === '+' ||
+                                (b.getAttribute('aria-label') || '').match(/add|upload|attach|plus/i)
+                            ) || null;
+                        }"""
+                    )
+
+                if plus_btn:
+                    plus_btn.click()
+                    page.wait_for_timeout(600)
+                else:
+                    logger.warning("[gemini] '+' button not found — trying attach without menu")
+
+                # Step 2: Click "Upload files" menu item.
+                # Use expect_file_chooser so Playwright intercepts the OS dialog.
+                upload_clicked = False
+                for item_text in ("Upload files", "Upload file", "Upload", "From device", "From computer"):
+                    for sel in (
+                        f'[role="menuitem"]:has-text("{item_text}")',
+                        f'li:has-text("{item_text}")',
+                        f'button:has-text("{item_text}")',
+                        f'text="{item_text}"',
+                    ):
+                        try:
+                            item = page.query_selector(sel)
+                            if item and item.is_visible():
+                                # Intercept file chooser BEFORE clicking the item
+                                with page.expect_file_chooser(timeout=5000) as fc_info:
+                                    item.click()
+                                fc = fc_info.value
+                                fc.set_files([str(p) for p in attachments])
+                                upload_clicked = True
+                                logger.info(f"[gemini] Attached {len(attachments)} file(s) via file chooser")
+                                break
+                        except Exception:
+                            continue
+                    if upload_clicked:
+                        break
+
+                if not upload_clicked:
+                    # Fallback: maybe clicking "+" directly opens file chooser (some Gemini builds)
+                    logger.warning("[gemini] Upload menu item not found — trying direct file chooser on '+'")
+                    if plus_btn:
+                        with page.expect_file_chooser(timeout=5000) as fc_info:
+                            plus_btn.click()
+                        fc_info.value.set_files([str(p) for p in attachments])
+                        logger.info(f"[gemini] Attached {len(attachments)} file(s) via direct '+' file chooser")
+
+                logger.info(f"[gemini] phase=attached count={len(attachments)}")
+                page.wait_for_timeout(2000)  # wait for upload progress
+            except Exception as e:
+                logger.warning(f"[gemini] attach failed (continuing): {e}")
+
+        # Count existing response turns BEFORE sending to detect new reply.
+        def _count_response_turns() -> int:
+            try:
+                return page.evaluate("""() => {
+                    const els = document.querySelectorAll(
+                        'model-response, message-content, [data-response-id], ' +
+                        '.response-content, .model-response-text'
+                    );
+                    return els.length;
+                }""")
+            except Exception:
+                return 0
+
+        def _get_last_response_text() -> str:
+            """Extract text ONLY from the last model response bubble."""
+            try:
+                return page.evaluate("""() => {
+                    const candidates = [
+                        ...document.querySelectorAll(
+                            'model-response, message-content, [data-response-id]'
+                        )
+                    ];
+                    if (candidates.length > 0) {
+                        const last = candidates[candidates.length - 1];
+                        return (last.innerText || last.textContent || '').trim();
+                    }
+                    // Fallback: last large text block in the response area
+                    const blocks = [...document.querySelectorAll(
+                        '.response-content, .model-response-text, ' +
+                        'div[class*="response"], div[class*="message"][class*="model"]'
+                    )];
+                    if (blocks.length > 0) {
+                        const last = blocks[blocks.length - 1];
+                        return (last.innerText || last.textContent || '').trim();
+                    }
+                    return '';
+                }""")
+            except Exception:
+                return ""
+
+        turns_before = _count_response_turns()
+        logger.info(f"[gemini] turns before send: {turns_before}")
+
+        input_el = page.query_selector(input_sel)
+        if not input_el:
+            raise RuntimeError("Gemini: prompt input not found.")
+        input_el.click()
+        page.wait_for_timeout(200)
+        try:
+            page.keyboard.press("Control+a")
+            page.keyboard.press("Delete")
         except Exception:
             pass
+        page.wait_for_timeout(150)
+        self._type_multiline(page, message, delay=6)
+        page.wait_for_timeout(300)
+
+        # Send: prefer the explicit Send button; fall back to Enter ONCE.
+        sent = False
+        for sel in ('button[aria-label*="Send" i]',
+                    'button[aria-label*="Submit" i]',
+                    'button:has-text("Send")'):
+            try:
+                btn = page.query_selector(sel)
+                if btn and btn.is_enabled() and btn.is_visible():
+                    btn.click()
+                    sent = True
+                    break
+            except Exception:
+                continue
+        if not sent:
+            page.keyboard.press("Enter")
+
+        # ---- Wait for the reply to settle ----
+        effective_timeout = max(timeout, 240)
+        page.wait_for_timeout(2000)
+        deadline = time.time() + effective_timeout
+        last_text = ""
+        stable_ticks = 0
+        new_seen = False
+
+        def _is_generating() -> bool:
+            try:
+                return page.evaluate("""() => {
+                    const stop = document.querySelector(
+                        'button[aria-label*="Stop" i], button[aria-label*="Cancel" i]');
+                    if (stop) {
+                        const r = stop.getBoundingClientRect();
+                        if (r.width > 0 && r.height > 0) return true;
+                    }
+                    const body = (document.body.innerText || '');
+                    if (/generating|creating image|membuat gambar/i.test(body)) return true;
+                    return false;
+                }""")
+            except Exception:
+                return False
+
+        def _has_generated_image() -> bool:
+            """True once the generated still's <img> (blob/http, >=100px) has
+            actually rendered inside a <generated-image>/<single-image>."""
+            try:
+                return page.evaluate("""() => {
+                    const els = document.querySelectorAll(
+                        'generated-image img, single-image img');
+                    for (const img of els) {
+                        const w = img.naturalWidth || img.getBoundingClientRect().width;
+                        const h = img.naturalHeight || img.getBoundingClientRect().height;
+                        if (img.complete && w >= 100 && h >= 100 &&
+                            (img.currentSrc || img.src)) return true;
+                    }
+                    return false;
+                }""")
+            except Exception:
+                return False
+
+        # Does this prompt expect an image? If so, don't settle on text alone —
+        # wait for the still to appear (Gemini often returns little/no text for
+        # pure image generations, so last_text stays empty).
+        expect_image = bool(re.search(
+            r"image|photo|gambar|foto|photoreal|vertical|render",
+            message, re.I))
+
+        while time.time() < deadline:
+            page.wait_for_timeout(1000)
+            # Detect new reply turn
+            current_turns = _count_response_turns()
+            if current_turns > turns_before:
+                new_seen = True
+
+            # Extract ONLY the last response bubble — never the full body
+            reply_text = _get_last_response_text()
+            if not reply_text and new_seen:
+                reply_text = last_text  # keep last good value during page nav
+
+            if reply_text == last_text:
+                stable_ticks += 1
+            else:
+                stable_ticks = 0
+                last_text = reply_text
+
+            img_ready = _has_generated_image()
+
+            # If we're expecting an image, the image MUST be present (and
+            # generation finished) before we break — regardless of text.
+            if expect_image:
+                if img_ready and not _is_generating():
+                    break
+                # Safety net: if generation clearly stopped and we still have
+                # text but no image after a while, don't hang forever.
+                if new_seen and last_text and stable_ticks >= 12 and not _is_generating():
+                    break
+            else:
+                if new_seen and last_text and stable_ticks >= 3 and not _is_generating():
+                    break
+                if new_seen and last_text and stable_ticks >= 8:
+                    break
+
+        # ---- Harvest a generated image from Gemini ----
+        # Strategy:
+        # 1. Find the best candidate <img> in the last response bubble
+        # 2. Try downloading via browser fetch (uses session cookies) first
+        # 3. Fall back to Playwright context request
+        # 4. Fall back to canvas/blob extraction
+        media: list[dict] = []
+        try:
+            # Gemini renders the GENERATED still inside a <generated-image> /
+            # <single-image> custom element, and its <img> src is a blob: URL
+            # (e.g. blob:https://gemini.google.com/...). User-uploaded ref
+            # photos, by contrast, live in <user-query-file-preview> as small
+            # 80x80 lh3.googleusercontent.com thumbnails. We must pick the
+            # FORMER and ignore the latter — ranking purely by pixel area is
+            # not enough because a 512x452 thumbnail can outscore nothing.
+            #
+            # So: (1) restrict the scope to the generated-image containers
+            # first, (2) only fall back to a generic scan if none exist, and
+            # (3) explicitly drop user-upload preview thumbnails.
+            candidates = page.evaluate("""() => {
+                const imgs = [];
+                document.querySelectorAll('img').forEach(img => {
+                    const src = img.currentSrc || img.src || '';
+                    if (!src) return;
+                    // Skip the user's uploaded reference thumbnails.
+                    if (/preview-image/.test((img.className || '') + '')) return;
+                    if (img.closest('user-query-file-preview')) return;
+                    const r = img.getBoundingClientRect();
+                    const w = img.naturalWidth || r.width;
+                    const h = img.naturalHeight || r.height;
+                    if (w < 100 || h < 100) return;
+                    imgs.push({
+                        src,
+                        scheme: (src.split(':')[0] || ''),
+                        score: w * h,
+                        w, h,
+                        complete: img.complete,
+                        inGenerated: !!img.closest('generated-image, single-image'),
+                    });
+                });
+                // If the generated still is present, keep ONLY those — never
+                // let a stray thumbnail win.
+                const generated = imgs.filter(i => i.inGenerated);
+                const pool = generated.length ? generated : imgs;
+                pool.sort((a, b) => b.score - a.score);
+                return pool.slice(0, 5);
+            }""")
+
+            logger.info(
+                "[gemini] image candidates: "
+                + str([(c.get("scheme"), c.get("w"), c.get("h"),
+                        c.get("inGenerated"), c["src"][:60])
+                       for c in (candidates or [])]))
+
+            for cand in (candidates or []):
+                src = cand.get("src", "")
+                if not src:
+                    continue
+
+                local = None
+
+                # blob: URLs are bound to the live document and frequently get
+                # revoked the moment rendering completes, so a later fetch(blob)
+                # fails silently. The reliable path is to draw the already-
+                # rendered <img> onto a <canvas> and export PNG pixels directly —
+                # this works even after the blob handle is gone. We locate the
+                # img element by its src and read it in-page.
+                if src.startswith("blob:"):
+                    try:
+                        b64 = page.evaluate("""async (url) => {
+                            // find the matching, fully-loaded image element
+                            const imgs = [...document.querySelectorAll(
+                                'generated-image img, single-image img, img')];
+                            let img = imgs.find(i =>
+                                (i.currentSrc || i.src) === url) ||
+                                imgs.find(i => i.closest('generated-image, single-image'));
+                            if (!img) return null;
+                            // ensure decoded
+                            try { if (img.decode) await img.decode(); } catch(e) {}
+                            const w = img.naturalWidth, h = img.naturalHeight;
+                            if (!w || !h) return null;
+                            const c = document.createElement('canvas');
+                            c.width = w; c.height = h;
+                            const ctx = c.getContext('2d');
+                            ctx.drawImage(img, 0, 0, w, h);
+                            try {
+                                return c.toDataURL('image/png').split(',')[1] || null;
+                            } catch(e) { return null; }  // tainted canvas
+                        }""", src)
+                        if b64:
+                            ts = time.strftime("%Y%m%d_%H%M%S")
+                            short = _hash_url(src)
+                            out = self.media_dir / f"gemini_{ts}_{short}.png"
+                            out.write_bytes(base64.b64decode(b64))
+                            local = out
+                            logger.info(f"[gemini] Downloaded blob image via canvas: {out}")
+                    except Exception as e_canvas:
+                        logger.debug(f"[gemini] canvas extract failed: {e_canvas}")
+                    # Fallback: try a direct blob fetch (works if still alive).
+                    if not local:
+                        local = self._download_to_media(src, ".png")
+                        if local:
+                            logger.info(f"[gemini] Downloaded blob image via fetch: {local}")
+                elif src.startswith("data:"):
+                    local = self._download_to_media(src, ".png")
+                    if local:
+                        logger.info(f"[gemini] Downloaded data: image: {local}")
+                else:
+                    # http(s) (e.g. lh3.googleusercontent.com full-size):
+                    # in-page fetch first (carries the Google session), then
+                    # Playwright context request as fallback.
+                    try:
+                        b64 = page.evaluate("""async (url) => {
+                            try {
+                                const resp = await fetch(url);
+                                if (!resp.ok) return null;
+                                const buf = await resp.arrayBuffer();
+                                const bytes = new Uint8Array(buf);
+                                let bin = '';
+                                for (let i = 0; i < bytes.byteLength; i++)
+                                    bin += String.fromCharCode(bytes[i]);
+                                return btoa(bin);
+                            } catch(e) { return null; }
+                        }""", src)
+                        if b64:
+                            ts = time.strftime("%Y%m%d_%H%M%S")
+                            short = _hash_url(src)
+                            out = self.media_dir / f"gemini_{ts}_{short}.png"
+                            out.write_bytes(base64.b64decode(b64))
+                            local = out
+                            logger.info(f"[gemini] Downloaded image via browser fetch: {out}")
+                    except Exception as e_fetch:
+                        logger.debug(f"[gemini] browser fetch failed: {e_fetch}")
+
+                    if not local:
+                        local = self._download_to_media(src, ".png")
+                        if local:
+                            logger.info(f"[gemini] Downloaded image via context request: {local}")
+
+                if local and Path(local).exists() and Path(local).stat().st_size > 1000:
+                    media.append({"type": "image", "url": src,
+                                  "local_path": str(local)})
+                    logger.info(f"[gemini] Image harvested OK ({Path(local).stat().st_size} bytes)")
+                    break  # got one good image, stop
+                elif local:
+                    logger.debug(f"[gemini] Downloaded file too small, skipping")
+
+            if not media:
+                logger.warning("[gemini] No image harvested from response")
+        except Exception as e:
+            logger.warning(f"[gemini] image harvest failed: {e}")
+
+        if not last_text and not media:
+            debug = self._save_debug_artifacts(tag="gemini_no_response")
+            logger.error(f"[gemini] No response. Debug: {debug}. URL: {self.current_url()}")
+            raise TimeoutError("No response received from Gemini within timeout")
 
         return {"text": last_text, "media": media}
 
@@ -2303,26 +2758,50 @@ class ChatSession:
 
                     # --- Image extraction (only for image mode) ---
                     else:
-                        img_srcs = page.evaluate("""() => {
-                            const results = [];
+                        # Grok shows a BLURRED low-res placeholder while the
+                        # image is still rendering. The old code grabbed the
+                        # first <img> >=200px and broke immediately, so it
+                        # frequently saved that blur (the noisy ~70KB stills).
+                        # Now we (a) wait for a completion indicator and
+                        # (b) only accept an image whose *intrinsic* resolution
+                        # is full-size, choosing the largest candidate.
+                        info = page.evaluate("""() => {
+                            const done = !!document.querySelector(
+                                '[aria-label="Download"], [aria-label="Save"]') ||
+                                Array.from(document.querySelectorAll('button'))
+                                     .some(b => (b.textContent||'').includes('Make video'));
+                            const imgs = [];
                             document.querySelectorAll('img').forEach(img => {
                                 const r = img.getBoundingClientRect();
                                 const src = img.src || '';
-                                if (!src || src.startsWith('data:')) return;
-                                // Large images on results page (generated content)
-                                if (r.width >= 200 && r.height >= 200) {
-                                    results.push(src);
-                                }
+                                if (!src || src.startsWith('data:') || src.startsWith('blob:')) return;
+                                if (r.width < 200 || r.height < 200) return;
+                                imgs.push({
+                                    src,
+                                    nw: img.naturalWidth || 0,
+                                    nh: img.naturalHeight || 0,
+                                    complete: img.complete === true,
+                                });
                             });
-                            return [...new Set(results)];
+                            return {done, imgs};
                         }""")
-                        for src in (img_srcs or []):
-                            if src not in [m.get("url") for m in result_media]:
-                                local = self._download_to_media(src, ".png")
+                        cand = (info or {}).get("imgs", []) or []
+                        done = (info or {}).get("done", False)
+                        # Finished frames are intrinsically large; the blurred
+                        # placeholder is a small image stretched to display size.
+                        ready = [c for c in cand
+                                 if c.get("complete") and c.get("nw", 0) >= 512
+                                 and c.get("nh", 0) >= 512]
+                        if ready and done:
+                            ready.sort(key=lambda c: c["nw"] * c["nh"], reverse=True)
+                            best = ready[0]["src"]
+                            if best not in [m.get("url") for m in result_media]:
+                                local = self._download_to_media(best, ".png")
                                 result_media.append({
-                                    "type": "image", "url": src,
+                                    "type": "image", "url": best,
                                     "local_path": str(local) if local else "",
                                 })
+                        # else: still rendering -> keep polling, don't grab blur.
                 except Exception as e:
                     logger.warning(f"[grok-imagine] Media extract error: {e}")
 
@@ -2333,44 +2812,41 @@ class ChatSession:
                     self._dump_phase("imagine_10_done")
                     break
 
-        # Final attempt: if we have URL change but no media downloaded,
-        # try to get the page's main image via screenshot or direct URL
+        # Final attempt: if we have a URL change but nothing downloaded yet,
+        # wait a bit longer and take the single highest-resolution image
+        # (or the video). Picking by intrinsic size avoids grabbing a UI icon
+        # or a leftover blurred preview.
         if not result_media:
             try:
-                # One more try with longer wait
                 page.wait_for_timeout(5000)
-                img_srcs = page.evaluate("""() => {
-                    const results = [];
+                picked = page.evaluate("""() => {
+                    let best = null;
                     document.querySelectorAll('img').forEach(img => {
                         const r = img.getBoundingClientRect();
                         const src = img.src || '';
-                        if (!src || src.startsWith('data:')) return;
-                        if (r.width >= 150 && r.height >= 150) results.push(src);
+                        if (!src || src.startsWith('data:') || src.startsWith('blob:')) return;
+                        if (r.width < 150 || r.height < 150) return;
+                        const score = (img.naturalWidth||0) * (img.naturalHeight||0);
+                        if (!best || score > best.score) best = {src, score};
                     });
-                    // Also check for video
-                    document.querySelectorAll('video').forEach(v => {
-                        const src = v.src || v.currentSrc || '';
-                        if (src) results.push('VIDEO:' + src);
-                        v.querySelectorAll('source').forEach(s => {
-                            if (s.src) results.push('VIDEO:' + s.src);
-                        });
-                    });
-                    return [...new Set(results)];
+                    let vsrc = '';
+                    const v = document.querySelector('video');
+                    if (v) vsrc = v.src || v.currentSrc || '';
+                    return {img: best ? best.src : '', video: vsrc};
                 }""")
-                for src in (img_srcs or []):
-                    if src.startswith('VIDEO:'):
-                        actual = src[6:]
-                        local = self._download_to_media(actual, ".mp4")
-                        result_media.append({
-                            "type": "video", "url": actual,
-                            "local_path": str(local) if local else "",
-                        })
-                    else:
-                        local = self._download_to_media(src, ".png")
-                        result_media.append({
-                            "type": "image", "url": src,
-                            "local_path": str(local) if local else "",
-                        })
+                picked = picked or {}
+                if mode == "video" and picked.get("video"):
+                    local = self._download_to_media(picked["video"], ".mp4")
+                    result_media.append({
+                        "type": "video", "url": picked["video"],
+                        "local_path": str(local) if local else "",
+                    })
+                elif picked.get("img"):
+                    local = self._download_to_media(picked["img"], ".png")
+                    result_media.append({
+                        "type": "image", "url": picked["img"],
+                        "local_path": str(local) if local else "",
+                    })
             except Exception as e:
                 logger.warning(f"[grok-imagine] Final media attempt failed: {e}")
 
