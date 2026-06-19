@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FakeFluencer V2</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <nav class="nav">
+    <div class="brand"><span class="mark">◢</span> FakeFluencer <span class="v">V2</span></div>
+    <div class="nav-links">
+      <button data-page="dashboard" class="active">Dashboard</button>
+      <button data-page="create">Create</button>
+      <button data-page="chat">Chat</button>
+      <button data-page="bank">Bank</button>
+      <button data-page="history">History</button>
+      <button data-page="settings">Settings</button>
+    </div>
+    <div class="nav-right">
+      <span class="pill"><span id="navDot" class="dot"></span><span id="navStatus">connecting…</span></span>
+      <span class="pill" id="navMode">CDP</span>
+    </div>
+  </nav>
+
+  <div class="wrap">
+
+    <!-- DASHBOARD -->
+    <section id="dashboard" class="page active">
+      <div class="page-head flex between">
+        <div><p class="eyebrow">Command center // CDP profiles</p><h1 class="title">Dashboard</h1></div>
+        <span class="pill">VER: <span id="verTag">2.0.0</span></span>
+      </div>
+      <div class="grid cols-3">
+        <div class="card pad-lg">
+          <div class="stage">
+            <span class="badge"><span id="stageDot" class="dot on"></span> <span id="stageBadge">STANDBY</span></span>
+            <div class="stage-center"><div class="ico">◍</div><div id="stageMsg">No active profile</div></div>
+            <div class="stage-foot"><div class="stage-state" id="stageState">IDLE</div><div class="stage-sub" id="stageSub">Awaiting input</div></div>
+            <button class="btn primary stage-cta" onclick="go('create')">＋ New project</button>
+          </div>
+        </div>
+        <div class="card pad-lg">
+          <h2>System status</h2>
+          <div class="stat-row"><span class="stat-label">CDP host</span><span class="stat-val" id="stCdp" style="font-size:14px">—</span></div>
+          <div class="stat-row"><span class="stat-label">Profiles</span><span class="stat-val" id="stProfiles">0</span></div>
+          <div class="stat-row"><span class="stat-label">Reachable</span><span class="stat-val" id="stReach">0</span></div>
+          <div class="stat-row"><span class="stat-label">API server</span><span class="stat-val" id="stApi">off</span></div>
+          <div class="metric-cards">
+            <div class="metric"><div class="k">Jobs total</div><div class="n" id="mTotal">0</div></div>
+            <div class="metric"><div class="k">Active</div><div class="n" id="mActive">0</div></div>
+          </div>
+        </div>
+      </div>
+      <div class="card mt">
+        <h2>Recent activity</h2>
+        <div id="recentJobs"><div class="empty"><div class="ico">≋</div><div class="t">No jobs yet</div><div>Mulai dari Create dan akan tampil di sini.</div></div></div>
+      </div>
+    </section>
+
+    <!-- CREATE -->
+    <section id="create" class="page">
+      <div class="page-head"><p class="eyebrow">Generator</p><h1 class="title">Create</h1>
+        <p class="subtitle">Pilih akun (profil) untuk skrip & gambar, upload foto, lalu Generate. Semua lewat Chrome profil via CDP.</p></div>
+      <div class="grid cols-3">
+        <div>
+          <div class="card mb">
+            <h2 class="tight">Project</h2>
+            <div class="row2">
+              <div class="field"><label>Nama project</label><input type="text" id="cProject" value="Project_Baru"></div>
+              <div class="field"><label>Mode</label><select id="cMode"></select></div>
+            </div>
+            <div class="row3">
+              <div class="field"><label>Jumlah scene</label><input type="number" id="cScenes" value="2" min="1" max="10"></div>
+              <div class="field"><label>Format gambar</label><select id="cAspect"></select></div>
+              <div class="field"><label>Output</label>
+                <div class="seg" id="cOutput"><button data-v="video" class="active">🎬 Video</button><button data-v="image">🖼 Image</button></div>
+              </div>
+            </div>
+            <div class="field"><label>Latar belakang</label><input type="text" id="cBg" value="Meja rias kayu minimalis dengan pencahayaan hangat"></div>
+          </div>
+          <div class="card mb">
+            <h2 class="tight">Akun & suara</h2>
+            <div class="row2">
+              <div class="field"><label>Profil penyedia skrip</label><select id="cScriptProfile"></select></div>
+              <div class="field"><label>Profil pembuat gambar</label><select id="cImageProfile"></select></div>
+            </div>
+            <div class="field"><label>Profil render video/foto final <span style="font-weight:400;opacity:.7">(Grok atau Gemini — kosong = ikut profil gambar)</span></label><select id="cRenderProfile"></select></div>
+            <div class="row3">
+              <div class="field"><label>Profil suara</label><select id="cVoice"></select></div>
+              <div class="field"><label>Nada emosional</label><select id="cTone"></select></div>
+              <div class="field" id="vdurWrap"><label>Durasi video</label><select id="cVdur"><option>6s</option><option>10s</option></select></div>
+            </div>
+            <div class="field" id="vresWrap"><label>Resolusi video</label><select id="cVres"><option>720p (Quality)</option><option>480p (Speed)</option></select></div>
+          </div>
+          <div class="card">
+            <h2 class="tight">Upload</h2>
+            <div class="row2">
+              <div><div class="drop" id="dropModel"><div class="t">📷 Foto Model</div><div class="s">klik untuk pilih</div></div><div class="thumbs" id="thumbsModel"></div></div>
+              <div><div class="drop" id="dropProduct"><div class="t">🧴 Foto Produk</div><div class="s">klik untuk pilih</div></div><div class="thumbs" id="thumbsProduct"></div></div>
+            </div>
+            <input type="file" id="fileModel" accept="image/*" multiple hidden>
+            <input type="file" id="fileProduct" accept="image/*" multiple hidden>
+            <div class="field mt"><label>Nama produk (opsional)</label><input type="text" id="cProdName" placeholder="kosong = ikut hasil skrip"></div>
+          </div>
+        </div>
+        <div>
+          <div class="card mb">
+            <button class="btn primary block lg" id="btnGenerate">🚀 Generate</button>
+            <button class="btn danger block mt" id="btnCancelGen" style="display:none">✖ Batalkan</button>
+            <label class="cf-toggle mt"><input type="checkbox" id="cAutochain" checked> <span>Auto-chain ke render final (Script → ZIP → Video/Image)</span></label>
+            <div class="note mt">Pastikan profil yang dipilih sudah login (cek di Bank). Job berjalan di latar; log tampil langsung.</div>
+          </div>
+          <div class="card">
+            <h2 class="tight">Log proses</h2>
+            <div class="log" id="genLog"><span class="ln muted">Siap. Pilih profil, upload foto, lalu Generate.</span></div>
+            <div id="genResult"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- CHAT -->
+    <section id="chat" class="page">
+      <div class="page-head"><p class="eyebrow">Bridge</p><h1 class="title">Chat</h1>
+        <p class="subtitle">Mengobrol lewat akun (profil) mana pun. Grok bisa Imagine. Media tersimpan di History.</p></div>
+      <div class="card mb">
+        <div class="flex" style="flex-wrap:wrap;gap:14px">
+          <div class="field" style="margin:0;min-width:240px"><label>Profil</label><select id="chatProfile"></select></div>
+          <label class="flex" style="gap:6px;font-size:13px;align-self:flex-end;padding-bottom:10px"><input type="checkbox" id="chatNew"> Chat baru</label>
+          <button class="btn ghost" id="btnChatNew" style="align-self:flex-end">🔄 Reset chat</button>
+        </div>
+        <div id="imaginePanel" class="row3 mt" style="display:none">
+          <div class="field" style="margin:0"><label>Imagine</label><select id="imgMode"><option value="">Mati</option><option value="image">🖼 Image</option><option value="video">🎬 Video</option></select></div>
+          <div class="field" style="margin:0"><label>Aspect</label><select id="imgAspect"></select></div>
+          <div class="field" style="margin:0"><label>Resolusi</label><select id="imgRes"><option>720p</option><option>480p</option></select></div>
+        </div>
+      </div>
+      <div class="card">
+        <h2 class="tight">Percakapan</h2>
+        <div class="log" id="chatLog" style="height:380px;background:var(--paper)"><span class="ln muted">Pilih profil lalu mulai…</span></div>
+        <div id="chatMedia" class="gallery mt"></div>
+        <div class="thumbs" id="chatAttachThumbs"></div>
+        <div class="flex mt" style="gap:8px">
+          <button class="btn ghost" id="btnChatAttach">📎</button>
+          <input type="text" id="chatInput" placeholder="Tulis pesan…" style="flex:1" onkeydown="if(event.key==='Enter')document.getElementById('btnChatSend').click()">
+          <button class="btn primary" id="btnChatSend">Kirim</button>
+        </div>
+        <input type="file" id="chatFile" accept="image/*,application/pdf,video/*" multiple hidden>
+      </div>
+    </section>
+
+    <!-- BANK (profiles) -->
+    <section id="bank" class="page">
+      <div class="page-head flex between">
+        <div><p class="eyebrow">Account bank // Chrome profiles via CDP</p><h1 class="title">Bank</h1>
+          <p class="subtitle">Tiap akun = satu profil Chrome. Tambah akun = tambah profil. Login dilakukan di server lewat noVNC.</p></div>
+        <a class="btn ghost" id="novncLink" target="_blank">🖥 Buka noVNC (login)</a>
+      </div>
+      <div class="grid cols-3">
+        <div class="card">
+          <h2>Profil terdaftar</h2>
+          <div id="profileList"><div class="empty"><div class="ico">⛁</div><div class="t">Belum ada profil</div><div>Tambah profil di panel kanan.</div></div></div>
+        </div>
+        <div>
+          <div class="card mb">
+            <h2 class="tight">Tambah profil (akun)</h2>
+            <div class="field"><label>Platform</label>
+              <select id="profPlatform"><option value="chatgpt">ChatGPT</option><option value="grok">Grok</option><option value="gemini">Gemini</option><option value="aistudio">AI Studio</option></select></div>
+            <div class="field"><label>Label akun</label><input type="text" id="profLabel" value="main" placeholder="mis. main / akun2 / kerja"></div>
+            <button class="btn primary block" id="btnAddProfile">＋ Tambah profil</button>
+            <div class="note mt"><b>Setelah tambah:</b> jalankan <code>docker compose restart chrome</code> agar Chrome baru hidup, lalu buka noVNC dan login ke akun itu sekali. Login menetap di volume.</div>
+          </div>
+          <div class="card">
+            <h2 class="tight">Log</h2>
+            <div class="log" id="bankLog" style="height:170px"><span class="ln muted">Idle.</span></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- HISTORY -->
+    <section id="history" class="page">
+      <div class="page-head flex between">
+        <div><p class="eyebrow">Output archive</p><h1 class="title">History</h1></div>
+        <button class="btn ghost" onclick="loadHistory()">↻ Refresh</button>
+      </div>
+      <div class="card"><div id="historyGrid"><div class="empty"><div class="ico">▤</div><div class="t">Belum ada output</div><div>Hasil generate muncul di sini.</div></div></div></div>
+    </section>
+
+    <!-- SETTINGS -->
+    <section id="settings" class="page">
+      <div class="page-head"><p class="eyebrow">Configuration</p><h1 class="title">Settings</h1></div>
+      <div class="grid cols-3">
+        <div>
+          <div class="card mb">
+            <h2 class="tight">OpenAI-compatible API server</h2>
+            <div class="row2">
+              <div class="field"><label>Port</label><input type="number" id="setApiPort" value="5100"></div>
+              <div class="field"><label>API key (opsional)</label><input type="password" id="setApiKey"></div>
+            </div>
+            <div class="flex">
+              <button class="btn primary" id="btnApiStart">▶ Start</button>
+              <button class="btn ghost" id="btnApiStop">■ Stop</button>
+              <span class="pill"><span id="apiDot" class="dot off"></span><span id="apiState">stopped</span></span>
+            </div>
+            <div class="note mt">Base URL: <b>http://localhost:<span id="apiPortEcho">5100</span>/v1</b></div>
+          </div>
+          <div class="card">
+            <h2 class="tight">Info CDP</h2>
+            <div class="stat-row"><span class="stat-label">CDP host</span><span class="stat-val" id="setCdpHost" style="font-size:14px">—</span></div>
+            <div class="note mt">Profil & port dikelola di tab <b>Bank</b>. File <code>profiles.json</code> menyimpan peta akun↔port dan dibaca oleh container chrome.</div>
+          </div>
+        </div>
+        <div>
+          <div class="card mb">
+            <h2 class="tight">LIVE — gabung video scene</h2>
+            <p class="muted" style="font-size:13px;margin-top:0">Bagian LIVE yang portabel (menggabungkan scene .mp4 jadi satu video panjang untuk dipasang sebagai source TikTok LIVE). Auto-reply suara tetap di aplikasi desktop.</p>
+            <div class="field"><label>Folder sumber</label><input type="text" id="mergeSrc" placeholder="media/generated"></div>
+            <div class="row2">
+              <div class="field"><label>Orientasi</label>
+                <div class="seg" id="mergePortrait"><button data-v="true" class="active">Vertikal</button><button data-v="false">Horizontal</button></div></div>
+              <div class="field"><label>Ulang hingga (menit, opsional)</label><input type="number" id="mergeLoop" placeholder="kosong = tanpa loop"></div>
+            </div>
+            <button class="btn primary block" id="btnMerge">🎬 Gabungkan video</button>
+            <div class="log mt" id="mergeLog" style="height:130px"><span class="ln muted">Idle.</span></div>
+            <div id="mergeResult"></div>
+          </div>
+          <button class="btn primary block lg" id="btnSaveSettings">💾 Simpan pengaturan</button>
+        </div>
+      </div>
+    </section>
+
+  </div>
+  <div id="confirmModal" class="modal-backdrop" style="display:none">
+    <div class="modal-card">
+      <h3 id="cfTitle">Konfirmasi Produk</h3>
+      <p class="cf-lead">Cek dulu detail produk sebelum bikin gambar. Edit kalau ada yang salah.</p>
+      <div class="field"><label>Merek</label><input type="text" id="cfBrand"></div>
+      <div class="field"><label>Produk / varian</label><input type="text" id="cfName"></div>
+      <div class="field"><label>Ukuran (ml)</label><input type="text" id="cfSize" placeholder="mis. 50"></div>
+      <p class="cf-note" id="cfNote"></p>
+      <div class="cf-actions">
+        <button class="btn ghost" id="cfCancel">Batal</button>
+        <button class="btn primary" id="cfOk">Lanjut →</button>
+      </div>
+    </div>
+  </div>
+  <div id="toasts"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

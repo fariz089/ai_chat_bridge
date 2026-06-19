@@ -1,0 +1,4 @@
+# Web UI dependencies (in addition to the project's main requirements.txt)
+flask>=3.0.0
+flask-cors>=4.0.0
+# playwright (client side of CDP) comes from the main requirements.txt

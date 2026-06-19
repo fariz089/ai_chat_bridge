@@ -40,6 +40,17 @@ from playwright.sync_api import sync_playwright, Page, BrowserContext
 
 from platforms.base import CHROME_ARGS, DESKTOP_UA, _STEALTH_INIT_JS
 
+# Optional: watermark removal for Gemini-generated images. If OpenCV/NumPy
+# aren't installed the pipeline still works — images are just saved as-is.
+try:
+    import cv2 as _cv2
+    import numpy as _np
+    _CV_OK = True
+    _CV_IMPORT_ERR = None
+except Exception as _e:  # pragma: no cover - optional dependency
+    _CV_OK = False
+    _CV_IMPORT_ERR = repr(_e)
+
 logger = logging.getLogger(__name__)
 
 
@@ -177,7 +188,24 @@ class ChatSession:
         This avoids Cloudflare detection because the browser is a real Chrome
         with a real profile, not Playwright's bundled Chromium.
         """
-        self._pw = sync_playwright().start()
+        try:
+            self._pw = sync_playwright().start()
+        except Exception as e:
+            # "It looks like you are using Playwright Sync API inside the
+            # asyncio loop" — a stray/running event loop on this thread blocks
+            # the sync driver. Replace this thread's loop with a fresh idle one
+            # and retry once. (Harmless when no loop was the real problem.)
+            if "asyncio" in str(e).lower() or "sync api" in str(e).lower():
+                logger.warning(f"[{self.platform}] sync_playwright start hit asyncio "
+                               f"loop conflict; resetting thread loop and retrying: {e}")
+                try:
+                    import asyncio as _asyncio
+                    _asyncio.set_event_loop(_asyncio.new_event_loop())
+                except Exception:
+                    pass
+                self._pw = sync_playwright().start()
+            else:
+                raise
 
         if self.cdp_url:
             # ── Connect to real Chrome via CDP ───────────────────────
@@ -190,13 +218,27 @@ class ChatSession:
             else:
                 self._context = self._browser.new_context()
 
-            # Find or create a page with the right platform URL
+            # Find or create a page on the right platform. Match by DOMAIN so we
+            # still grab the tab when the URL has a chat id (…/app/<id>) or is
+            # the bare domain — the strict home-URL prefix used to miss those.
             home = self._home_url()
+            domain = ""
+            try:
+                from urllib.parse import urlparse
+                domain = urlparse(home).netloc
+            except Exception:
+                domain = ""
             target_page = None
             for p in self._context.pages:
-                if home and home.rstrip("/") in p.url:
-                    target_page = p
-                    break
+                try:
+                    if p.is_closed():
+                        continue
+                    purl = (p.url or "")
+                    if domain and domain in purl:
+                        target_page = p
+                        break
+                except Exception:
+                    continue
 
             if target_page:
                 self._page = target_page
@@ -252,6 +294,115 @@ class ChatSession:
             logger.warning(f"[{self.platform}] Navigation warning: {e}")
         # Handle Cloudflare Turnstile challenge if present
         self._wait_for_cloudflare()
+
+    def _page_alive(self) -> bool:
+        """True if self._page exists AND its tab is genuinely usable.
+
+        ``is_closed()`` is necessary but NOT sufficient: after the user
+        refreshes the web UI, navigates Chrome, or the CDP target is swapped,
+        the cached Page can be *detached* while ``is_closed()`` still returns
+        False. The next ``wait_for_selector`` then dies with
+        "Target page, context or browser has been closed". We force a tiny
+        round-trip (``evaluate``) so a detached/dead tab is detected HERE,
+        where _ensure_page() can transparently re-acquire a live one.
+        """
+        p = self._page
+        if p is None:
+            return False
+        try:
+            if p.is_closed():
+                return False
+            # Cheap real round-trip to the tab. Raises if detached/dead.
+            p.evaluate("1")
+            return True
+        except Exception:
+            return False
+
+    def _ensure_page(self):
+        """Make sure self._page points at a live tab.
+
+        In CDP mode the tab we cached at connect time can be closed by the user,
+        replaced by Gemini's UI, or detached between the script step and the
+        image step of a Create job. When that happens Playwright raises
+        "Target page, context or browser has been closed" on the next call. Here
+        we detect a dead page and re-acquire a live one from the CDP context
+        (reusing an existing platform tab if present, else opening a fresh one).
+        """
+        if self._page_alive():
+            return
+        logger.warning(f"[{self.platform}] cached page is dead; re-acquiring")
+
+        # Reconnect the whole CDP session if the context/browser is gone too.
+        ctx = self._context
+        ctx_ok = False
+        try:
+            ctx_ok = ctx is not None and ctx.browser is not None and \
+                ctx.browser.is_connected()
+        except Exception:
+            ctx_ok = False
+        if not ctx_ok:
+            logger.warning(f"[{self.platform}] CDP context lost; reconnecting")
+            # After a long mid-job block (e.g. waiting on a user confirmation
+            # popup), the CDP connection can drop AND an async loop from another
+            # platform's SDK may still be installed on this thread. Guarantee a
+            # clean, non-running loop before reconnecting so connect_over_cdp()
+            # doesn't die with "Sync API inside the asyncio loop".
+            try:
+                import asyncio as _asyncio
+                try:
+                    _loop = _asyncio.get_event_loop_policy().get_event_loop()
+                    if _loop.is_running() or _loop.is_closed():
+                        raise RuntimeError("replace")
+                except Exception:
+                    _asyncio.set_event_loop(_asyncio.new_event_loop())
+            except Exception:
+                pass
+            self._ready = False
+            self.start()
+            return
+
+        home = self._home_url()
+        domain = ""
+        try:
+            from urllib.parse import urlparse
+            domain = urlparse(home).netloc
+        except Exception:
+            domain = ""
+        target = None
+        try:
+            for p in ctx.pages:
+                try:
+                    if p.is_closed():
+                        continue
+                    purl = (p.url or "")
+                    # Match by domain so we still grab the tab when the URL has
+                    # a chat id (…/app/<id>) or is the bare domain.
+                    if domain and domain in purl:
+                        # Validate the candidate is genuinely usable, not just
+                        # "not closed" — a detached tab would otherwise be
+                        # handed back and crash on the next selector wait.
+                        try:
+                            p.evaluate("1")
+                        except Exception:
+                            continue
+                        target = p
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            target = None
+
+        if target is None:
+            try:
+                target = ctx.new_page()
+                self._page = target
+                self._goto_home()
+                return
+            except Exception as e:
+                logger.exception(f"[{self.platform}] could not open new page: {e}")
+                raise
+        self._page = target
+        logger.info(f"[{self.platform}] re-acquired live tab: {target.url}")
 
     def start_new_chat(self):
         """Reset to a fresh conversation by navigating to platform home."""
@@ -644,6 +795,43 @@ class ChatSession:
                         "chat_url": "", "is_new_chat": False}
             resolved.append(pp)
 
+        # In CDP mode the cached tab may have been closed/replaced since the
+        # last call (e.g. between the script and image steps of a Create job).
+        # Re-acquire a live page before we touch it.
+        if self.cdp_url:
+            try:
+                self._ensure_page()
+            except Exception as e:
+                # A long mid-job pause (e.g. user took minutes on the product
+                # confirmation popup) can drop the whole CDP session, not just
+                # the tab. Don't give up on the first failure — force a clean
+                # asyncio loop, tear down, and do one full reconnect.
+                logger.warning(f"[{self.platform}] tab acquire failed ({e}); "
+                               f"forcing full reconnect and retrying once")
+                try:
+                    import asyncio as _asyncio
+                    _asyncio.set_event_loop(_asyncio.new_event_loop())
+                except Exception:
+                    pass
+                try:
+                    self._ready = False
+                    try:
+                        if self._pw:
+                            self._pw.stop()
+                    except Exception:
+                        pass
+                    self._pw = None
+                    self._browser = None
+                    self._context = None
+                    self._page = None
+                    self.start()
+                    self._ensure_page()
+                except Exception as e2:
+                    return {"ok": False, "response": "", "platform": self.platform,
+                            "error": f"Could not acquire a live Chrome tab: {e2}",
+                            "elapsed_ms": 0, "media": [], "attachments_sent": [],
+                            "chat_url": "", "is_new_chat": False}
+
         # Decide whether this is a new chat. We start fresh if:
         #   - caller forced it, OR
         #   - we don't yet have an active chat in this session
@@ -654,7 +842,8 @@ class ChatSession:
         # session), which previously caused replies to append to the wrong
         # conversation. Imagine mode handles its own navigation to /imagine,
         # so skip the home reset there.
-        if force_new_chat and not (imagine_opts and self.platform == "grok"):
+        _imagine_self_nav = imagine_opts and self.platform in ("grok", "gemini")
+        if force_new_chat and not _imagine_self_nav:
             try:
                 self.start_new_chat()
             except Exception as e:
@@ -664,6 +853,9 @@ class ChatSession:
         try:
             if imagine_opts and self.platform == "grok":
                 result = self._imagine_grok(message, timeout, imagine_opts, resolved)
+            elif imagine_opts and self.platform == "gemini" \
+                    and imagine_opts.get("mode") == "video":
+                result = self._imagine_gemini(message, timeout, imagine_opts, resolved)
             elif self.platform == "chatgpt":
                 result = self._chat_chatgpt(message, timeout, resolved)
             elif self.platform == "aistudio":
@@ -1555,6 +1747,471 @@ class ChatSession:
         return {"text": last_text, "media": media}
 
     # ------------------------------------------------------------------
+    # Gemini watermark removal (auto inpaint of the ✦ sparkle)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _sparkle_template(size):
+        """A normalised 4-point star (✦) template at the given size.
+
+        Concave arms via |x|^p+|y|^p<=1 with p<1. Mean-subtracted so it can be
+        used directly with TM_CCOEFF_NORMED.
+        """
+        t = _np.zeros((size, size), _np.float32)
+        c = (size - 1) / 2.0
+        for y in range(size):
+            for x in range(size):
+                dx = abs(x - c) / c if c else 0.0
+                dy = abs(y - c) / c if c else 0.0
+                t[y, x] = 1.0 if (dx ** 0.6 + dy ** 0.6) <= 1.0 else 0.0
+        return t - t.mean()
+
+    @classmethod
+    def _detect_gemini_sparkle(cls, img_bgr):
+        """Locate the Gemini ✦ sparkle watermark in the bottom-right zone.
+
+        Returns an (x, y, w, h) bounding box, or None when we're not confident.
+
+        Detection is by SHAPE, not brightness. The real Gemini sparkle is often
+        semi-transparent and low-contrast over bright clothing, so an intensity
+        threshold reliably mis-fires onto fabric highlights (that was the old
+        bug). Instead we build a local-contrast map (image minus its blur, which
+        suppresses both smooth gradients and long fabric-fold edges) and
+        template-match a 4-point star against it across a few scales. The peak
+        normalised correlation locates the sparkle; a minimum correlation acts
+        as the confidence gate so a clean image is left untouched.
+        """
+        H, W = img_bgr.shape[:2]
+        # Search only the bottom-right corner where Gemini places the mark.
+        zx0 = int(W * 0.70)
+        zy0 = int(H * 0.80)
+        zone = img_bgr[zy0:H, zx0:W]
+        if zone.size == 0:
+            return None
+        gray = _cv2.cvtColor(zone, _cv2.COLOR_BGR2GRAY).astype(_np.float32)
+        zh, zw = gray.shape
+        # Local contrast: bright-on-darker compact structure only.
+        detail = gray - _cv2.GaussianBlur(gray, (0, 0), 7)
+        detail = _np.clip(detail, 0, None)
+        best_corr, best_box = -1.0, None
+        for s in (22, 26, 30, 34, 38, 44):
+            if zh <= s or zw <= s:
+                continue
+            tpl = cls._sparkle_template(s)
+            res = _cv2.matchTemplate(detail, tpl, _cv2.TM_CCOEFF_NORMED)
+            _mn, mx, _ml, loc = _cv2.minMaxLoc(res)
+            if mx > best_corr:
+                best_corr = mx
+                best_box = (loc[0], loc[1], s, s)
+        # Template correlation locates the best candidate. It is necessary but
+        # NOT sufficient as a gate: a faint sparkle scores ~0.68 while smooth
+        # bright skin can reach ~0.72. So correlation only proposes a location;
+        # the real gate below verifies the structure is actually a 4-point star.
+        if best_box is None or best_corr < 0.62:
+            return None
+        x, y, w, h = best_box
+        # STRUCTURAL GATE — axis-vs-diagonal contrast. A ✦ sparkle has four
+        # bright arms along the vertical/horizontal axes with DARK gaps along
+        # the diagonals between them. Natural content (skin, fabric, lamp glow)
+        # is a smooth blob with no such directional gap. We measure, on the
+        # grayscale patch, the mean brightness along the 4 axes minus the mean
+        # along the 4 diagonals, normalised by the patch's local range. Real
+        # sparkles score clearly positive (~0.13-0.29 across faint and bright
+        # examples); clean regions sit near zero or negative.
+        pad0 = 4
+        gp = gray[max(0, y - pad0):y + h + pad0, max(0, x - pad0):x + w + pad0]
+        gh, gw = gp.shape
+        if gh < 10 or gw < 10:
+            return None
+        cy, cx = gh // 2, gw // 2
+        rmax = min(cy, cx)
+        ax, dg = [], []
+        for r in range(4, rmax):
+            ax.append((gp[cy - r, cx] + gp[cy + r, cx] +
+                       gp[cy, cx - r] + gp[cy, cx + r]) / 4.0)
+            dr = int(r * 0.707)
+            dg.append((gp[cy - dr, cx - dr] + gp[cy - dr, cx + dr] +
+                       gp[cy + dr, cx - dr] + gp[cy + dr, cx + dr]) / 4.0)
+        rng = float(gp.max() - gp.min()) + 1e-6
+        axis_diag = float(_np.mean(_np.array(ax) - _np.array(dg))) / rng
+        if axis_diag < 0.08:          # no directional arms -> not a sparkle
+            return None
+        pad = 6
+        fx = max(0, zx0 + x - pad)
+        fy = max(0, zy0 + y - pad)
+        fw = min(W - fx, w + pad * 2)
+        fh = min(H - fy, h + pad * 2)
+        return (fx, fy, fw, fh)
+
+    def _remove_gemini_watermark(self, path) -> bool:
+        """Detect and inpaint the Gemini sparkle watermark in-place.
+
+        Returns True if the image was modified. Safe no-op (returns False)
+        when OpenCV isn't available, the file can't be read, or no sparkle is
+        confidently detected — in all those cases the original is left intact.
+        """
+        if not _CV_OK:
+            logger.warning(
+                "[gemini] watermark removal skipped: OpenCV/NumPy not importable "
+                f"({_CV_IMPORT_ERR}). Install with: pip install opencv-python numpy")
+            return False
+        try:
+            img = _cv2.imread(str(path))
+            if img is None:
+                logger.warning(f"[gemini] watermark removal: could not read {path}")
+                return False
+            box = self._detect_gemini_sparkle(img)
+            if box is None:
+                logger.info(f"[gemini] watermark removal: no sparkle detected in {path}")
+                return False
+            x, y, w, h = box
+            # Build the inpaint mask from LOCAL contrast inside the box (the same
+            # signal the detector keys on), not an absolute brightness threshold
+            # — the real sparkle is often too faint to clear a fixed cutoff.
+            roi = _cv2.cvtColor(img[y:y + h, x:x + w], _cv2.COLOR_BGR2GRAY).astype(_np.float32)
+            detail = _np.clip(roi - _cv2.GaussianBlur(roi, (0, 0), 7), 0, None)
+            mx = float(detail.max())
+            if mx <= 1e-3:
+                logger.info(f"[gemini] watermark removal: no sparkle detected in {path}")
+                return False
+            bright = (detail >= mx * 0.15).astype(_np.uint8) * 255
+            # Dilate generously so the whole star + faint halo is covered, then
+            # close gaps so the arms join into one solid region (a thick bright
+            # sparkle on a dark background otherwise leaves arm tips behind).
+            bright = _cv2.dilate(
+                bright, _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (11, 11)))
+            bright = _cv2.morphologyEx(
+                bright, _cv2.MORPH_CLOSE,
+                _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (7, 7)))
+            mask = _np.zeros(img.shape[:2], _np.uint8)
+            mask[y:y + h, x:x + w] = bright
+            out = _cv2.inpaint(img, mask, 5, _cv2.INPAINT_TELEA)
+            _cv2.imwrite(str(path), out)
+            logger.info(f"[gemini] Removed sparkle watermark at {box} in {path}")
+            return True
+        except Exception as e:
+            logger.warning(f"[gemini] watermark removal failed: {e}")
+            return False
+
+    @classmethod
+    def _detect_gemini_sparkle_video(cls, img_bgr):
+        """Lenient sparkle locator tuned for Gemini *video* frames.
+
+        The still detector (``_detect_gemini_sparkle``) is deliberately strict
+        so it never touches a clean photo. But the Gemini video sparkle is
+        fainter and lower-contrast, so the strict gates often reject it. This
+        variant keeps the same shape-based approach (template-match a 4-point
+        star against a local-contrast map, then verify directional arms) but
+        relaxes the correlation and axis-vs-diagonal thresholds, and returns a
+        TIGHT box around the star so a later delogo doesn't smear the
+        background. Returns (x, y, w, h) or None.
+        """
+        H, W = img_bgr.shape[:2]
+        zx0 = int(W * 0.78)
+        zy0 = int(H * 0.74)
+        zone = img_bgr[zy0:H, zx0:W]
+        if zone.size == 0:
+            return None
+        gray = _cv2.cvtColor(zone, _cv2.COLOR_BGR2GRAY).astype(_np.float32)
+        zh, zw = gray.shape
+        detail = _np.clip(gray - _cv2.GaussianBlur(gray, (0, 0), 7), 0, None)
+        best_corr, best_box = -1.0, None
+        for s in (24, 30, 36, 44, 52, 60):
+            if zh <= s or zw <= s:
+                continue
+            tpl = cls._sparkle_template(s)
+            res = _cv2.matchTemplate(detail, tpl, _cv2.TM_CCOEFF_NORMED)
+            _mn, mx, _ml, loc = _cv2.minMaxLoc(res)
+            if mx > best_corr:
+                best_corr = mx
+                best_box = (loc[0], loc[1], s, s)
+        if best_box is None or best_corr < 0.50:   # relaxed (still: 0.62)
+            return None
+        x, y, w, h = best_box
+        pad0 = 4
+        gp = gray[max(0, y - pad0):y + h + pad0, max(0, x - pad0):x + w + pad0]
+        gh, gw = gp.shape
+        if gh < 10 or gw < 10:
+            return None
+        cy, cx = gh // 2, gw // 2
+        rmax = min(cy, cx)
+        ax, dg = [], []
+        for r in range(4, rmax):
+            ax.append((gp[cy - r, cx] + gp[cy + r, cx] +
+                       gp[cy, cx - r] + gp[cy, cx + r]) / 4.0)
+            dr = int(r * 0.707)
+            dg.append((gp[cy - dr, cx - dr] + gp[cy - dr, cx + dr] +
+                       gp[cy + dr, cx - dr] + gp[cy + dr, cx + dr]) / 4.0)
+        rng = float(gp.max() - gp.min()) + 1e-6
+        axis_diag = float(_np.mean(_np.array(ax) - _np.array(dg))) / rng
+        if axis_diag < 0.05:           # relaxed (still: 0.08)
+            return None
+        # Tight box — just the star plus a little margin.
+        pad = 4
+        fx = max(0, zx0 + x - pad)
+        fy = max(0, zy0 + y - pad)
+        fw = min(W - fx, w + pad * 2)
+        fh = min(H - fy, h + pad * 2)
+        return (fx, fy, fw, fh)
+
+    def _remove_gemini_watermark_video(self, path) -> bool:
+        """Strip the Gemini ✦ sparkle watermark from a VIDEO, in-place.
+
+        The visible mark Gemini stamps on generated video is the same 4-point
+        ✦ sparkle as on stills, burned into every frame in the bottom-right.
+        We reuse the EXACT still detector (``_detect_gemini_sparkle``) so the
+        position is found automatically rather than assumed:
+
+          1. Sample a handful of frames across the clip and run the existing
+             shape-based sparkle detector on each. Take the median bounding box
+             of the confident hits — robust against a single noisy frame and
+             against the sparkle fading in/out.
+          2. Pad the box slightly and feed it to ffmpeg's ``delogo`` filter,
+             which interpolates the surrounding pixels over the logo region for
+             the whole clip in one pass (re-encoding video, copying audio).
+
+        ``delogo`` is the best fit here: it's purpose-built for a fixed
+        rectangular logo, runs in a single ffmpeg pass (no frame-by-frame
+        extract/inpaint/reassemble), and needs no per-frame mask. The position
+        is still detected automatically — we only hand delogo the box the
+        detector found.
+
+        Returns True if the video was modified. Safe no-op (returns False, the
+        original left intact) when OpenCV is unavailable, ffmpeg is missing, no
+        sparkle is confidently detected in any sampled frame, or anything fails.
+        """
+        import shutil as _shutil
+        import subprocess as _subprocess
+
+        if not _CV_OK:
+            logger.warning(
+                "[gemini] video watermark removal skipped: OpenCV/NumPy not "
+                f"importable ({_CV_IMPORT_ERR}).")
+            return False
+        if _shutil.which("ffmpeg") is None or _shutil.which("ffprobe") is None:
+            logger.warning("[gemini] video watermark removal skipped: ffmpeg/ffprobe "
+                           "not found in PATH.")
+            return False
+
+        src = Path(path)
+        if not src.exists() or src.stat().st_size < 1024:
+            return False
+
+        try:
+            # --- Probe duration & dimensions ---
+            def _probe(stream_spec, fields):
+                out = _subprocess.check_output(
+                    ["ffprobe", "-v", "error", "-select_streams", stream_spec,
+                     "-show_entries", fields, "-of", "csv=p=0", str(src)],
+                    stderr=_subprocess.DEVNULL, timeout=30,
+                ).decode().strip()
+                return out
+
+            dur_s = 0.0
+            try:
+                d = _probe("v:0", "stream=duration")
+                dur_s = float((d.split("\n")[0] or "0").split(",")[0] or 0)
+            except Exception:
+                pass
+            if dur_s <= 0:
+                try:
+                    dur_s = float(_subprocess.check_output(
+                        ["ffprobe", "-v", "error", "-show_entries",
+                         "format=duration", "-of", "csv=p=0", str(src)],
+                        stderr=_subprocess.DEVNULL, timeout=30).decode().strip() or 0)
+                except Exception:
+                    dur_s = 0.0
+
+            # --- Sample frames and detect the sparkle on each ---
+            # Sample interior frames (avoid the very first/last where fades sit).
+            if dur_s > 0:
+                fracs = [0.15, 0.30, 0.45, 0.60, 0.75, 0.90]
+                sample_ts = [round(dur_s * f, 2) for f in fracs]
+            else:
+                sample_ts = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+
+            import tempfile as _tempfile
+            boxes = []
+            sampled_frames = []   # keep grayscale corner crops for temporal analysis
+            corner_x0 = corner_y0 = 0
+            with _tempfile.TemporaryDirectory() as td:
+                tdp = Path(td)
+                for i, ts in enumerate(sample_ts):
+                    frame_png = tdp / f"f{i}.png"
+                    rc = _subprocess.run(
+                        ["ffmpeg", "-y", "-ss", f"{ts}", "-i", str(src),
+                         "-frames:v", "1", str(frame_png)],
+                        stdout=_subprocess.DEVNULL, stderr=_subprocess.DEVNULL,
+                        timeout=60,
+                    ).returncode
+                    if rc != 0 or not frame_png.exists():
+                        continue
+                    img = _cv2.imread(str(frame_png))
+                    if img is None:
+                        continue
+                    # Try the lenient VIDEO detector first (tight box), then the
+                    # strict still detector as a secondary confirmation.
+                    box = (self._detect_gemini_sparkle_video(img)
+                           or self._detect_gemini_sparkle(img))
+                    if box is not None:
+                        boxes.append(box)
+                    # Stash the bottom-right corner (grayscale) for temporal
+                    # analysis: the sparkle is static across frames while the
+                    # subject moves, so it survives a per-pixel temporal MIN/mean
+                    # of the bright detail and pops out from moving content.
+                    Hh, Ww = img.shape[:2]
+                    corner_x0 = int(Ww * 0.78)
+                    corner_y0 = int(Hh * 0.72)
+                    g = _cv2.cvtColor(img[corner_y0:Hh, corner_x0:Ww],
+                                      _cv2.COLOR_BGR2GRAY).astype(_np.float32)
+                    sampled_frames.append(g)
+
+            # Probe real video dimensions (needed for both the detected-box
+            # clamp and the fixed-corner fallback).
+            vw = vh = 0
+            try:
+                wh = _probe("v:0", "stream=width,height")
+                parts = wh.replace("\n", ",").split(",")
+                vw, vh = int(parts[0]), int(parts[1])
+            except Exception:
+                pass
+            if not (vw and vh):
+                # Last resort: read one frame to learn the size.
+                try:
+                    import tempfile as _tf2
+                    with _tf2.TemporaryDirectory() as td2:
+                        fp = Path(td2) / "p.png"
+                        _subprocess.run(
+                            ["ffmpeg", "-y", "-ss", "0.5", "-i", str(src),
+                             "-frames:v", "1", str(fp)],
+                            stdout=_subprocess.DEVNULL, stderr=_subprocess.DEVNULL,
+                            timeout=60)
+                        im = _cv2.imread(str(fp))
+                        if im is not None:
+                            vh, vw = im.shape[:2]
+                except Exception:
+                    pass
+            if not (vw and vh):
+                logger.warning("[gemini] video watermark: could not read dimensions")
+                return False
+
+            # TEMPORAL detection — the sparkle is in the SAME pixels in every
+            # frame while the subject moves. Stacking the corner crops and
+            # taking the per-pixel MINIMUM of the bright local-contrast keeps
+            # only structures present in ALL frames (the static sparkle) and
+            # cancels moving content (face, hands, hair). This recovers a tight
+            # box even when single-frame detection fails on a faint mark.
+            temporal_box = None
+            if not boxes and len(sampled_frames) >= 3:
+                try:
+                    shapes = {f.shape for f in sampled_frames}
+                    if len(shapes) == 1:
+                        stack_detail = []
+                        for g in sampled_frames:
+                            d = _np.clip(g - _cv2.GaussianBlur(g, (0, 0), 6), 0, None)
+                            stack_detail.append(d)
+                        arr = _np.stack(stack_detail, axis=0)
+                        persistent = arr.min(axis=0)  # bright in EVERY frame
+                        mxv = float(persistent.max())
+                        if mxv > 4.0:
+                            mask = (persistent >= mxv * 0.4).astype(_np.uint8)
+                            mask = _cv2.morphologyEx(
+                                mask, _cv2.MORPH_CLOSE,
+                                _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (5, 5)))
+                            cnts, _ = _cv2.findContours(
+                                mask, _cv2.RETR_EXTERNAL, _cv2.CHAIN_APPROX_SIMPLE)
+                            best = None
+                            for c in cnts:
+                                bx, by, bw, bh = _cv2.boundingRect(c)
+                                area = bw * bh
+                                # sparkle is compact and roughly square
+                                if 60 <= area <= 12000 and 0.4 <= bw / max(bh, 1) <= 2.5:
+                                    if best is None or area > best[4]:
+                                        best = (bx, by, bw, bh, area)
+                            if best:
+                                bx, by, bw, bh, _a = best
+                                pad = 5
+                                temporal_box = (
+                                    max(0, corner_x0 + bx - pad),
+                                    max(0, corner_y0 + by - pad),
+                                    bw + pad * 2, bh + pad * 2)
+                                logger.info(f"[gemini] video watermark: temporal "
+                                            f"detection found box {temporal_box}")
+                except Exception as e:
+                    logger.debug(f"[gemini] temporal detection failed: {e}")
+
+            if len(boxes) >= 1:
+                # Auto-detected position. Use the median of hits (robust if >1),
+                # which is tight around the actual star so delogo doesn't smear
+                # the surrounding background. Even a single confident hit from
+                # the lenient video detector is reliable here.
+                arr = _np.array(boxes, dtype=_np.float32)
+                mx, my, mw, mh = (int(round(v)) for v in _np.median(arr, axis=0))
+                pad = 6
+                x = max(1, mx - pad)
+                y = max(1, my - pad)
+                w = mw + pad * 2
+                h = mh + pad * 2
+                mode_desc = f"auto-detected from {len(boxes)} sample(s)"
+            elif temporal_box is not None:
+                # Tight box from temporal (static-vs-moving) detection.
+                x, y, w, h = temporal_box
+                mode_desc = "temporal detection (static sparkle vs moving subject)"
+            else:
+                # LAST-RESORT FALLBACK — neither per-frame nor temporal
+                # detection located the sparkle. Gemini always burns the ✦ into
+                # the bottom-right; across observed 720p output it sits within
+                # x∈[0.865W, edge], y∈[0.78H, 0.93H]. This zone covers that
+                # range. It's the widest option and may slightly soften nearby
+                # background, but only triggers when detection truly fails.
+                x = int(vw * 0.845)
+                y = int(vh * 0.76)
+                w = vw - 1 - x
+                h = int(vh * 0.18)
+                mode_desc = "fixed bottom-right zone (detection failed)"
+
+            # delogo needs the box strictly inside the frame: x>0, y>0,
+            # x+w<W, y+h<H.
+            x = max(1, x)
+            y = max(1, y)
+            if x + w >= vw:
+                w = vw - x - 1
+            if y + h >= vh:
+                h = vh - y - 1
+            w = max(8, w)
+            h = max(8, h)
+
+            tmp_out = src.with_suffix(".dewm.mp4")
+            cmd = [
+                "ffmpeg", "-y", "-i", str(src),
+                "-vf", f"delogo=x={x}:y={y}:w={w}:h={h}:show=0",
+                "-c:a", "copy",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                "-movflags", "+faststart",
+                str(tmp_out),
+            ]
+            rc = _subprocess.run(
+                cmd, stdout=_subprocess.DEVNULL, stderr=_subprocess.DEVNULL,
+                timeout=600,
+            ).returncode
+            if rc != 0 or not tmp_out.exists() or tmp_out.stat().st_size < 1024:
+                logger.warning(f"[gemini] video watermark: ffmpeg delogo failed (rc={rc})")
+                try:
+                    tmp_out.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                return False
+
+            tmp_out.replace(src)
+            logger.info(
+                f"[gemini] Removed video sparkle watermark via delogo "
+                f"box=({x},{y},{w},{h}) [{mode_desc}] in {src.name}")
+            return True
+        except Exception as e:
+            logger.warning(f"[gemini] video watermark removal failed: {e}")
+            return False
+
+    # ------------------------------------------------------------------
     # Gemini (web app — gemini.google.com, uses the user's Pro login)
     # ------------------------------------------------------------------
 
@@ -1580,6 +2237,15 @@ class ChatSession:
                      'textarea')
         page.wait_for_selector(input_sel, timeout=25_000)
         page.wait_for_timeout(800)
+        # On slow connections the toolbar (where the "+"/upload button lives)
+        # renders after the input box. Give the page a moment to go idle so the
+        # attach button is actually visible before we try to click it.
+        if attachments:
+            try:
+                page.wait_for_load_state("networkidle", timeout=15_000)
+            except Exception:
+                pass
+            page.wait_for_timeout(1200)
 
         # Dismiss the occasional "Got it" / ToS / cookie prompts.
         for txt in ("Got it", "I agree", "Accept all", "No thanks", "Dismiss"):
@@ -1628,8 +2294,17 @@ class ChatSession:
                     )
 
                 if plus_btn:
-                    plus_btn.click()
-                    page.wait_for_timeout(600)
+                    try:
+                        plus_btn.click(timeout=6000)
+                    except Exception as e_click:
+                        # Element present but not clickable (page still settling
+                        # or layout differs). Don't block 30s — fall through to
+                        # the direct file-chooser fallback below.
+                        logger.warning(f"[gemini] '+' click not ready ({e_click}); "
+                                       "trying direct file chooser")
+                        plus_btn = None
+                    else:
+                        page.wait_for_timeout(600)
                 else:
                     logger.warning("[gemini] '+' button not found — trying attach without menu")
 
@@ -1663,8 +2338,8 @@ class ChatSession:
                     # Fallback: maybe clicking "+" directly opens file chooser (some Gemini builds)
                     logger.warning("[gemini] Upload menu item not found — trying direct file chooser on '+'")
                     if plus_btn:
-                        with page.expect_file_chooser(timeout=5000) as fc_info:
-                            plus_btn.click()
+                        with page.expect_file_chooser(timeout=8000) as fc_info:
+                            plus_btn.click(timeout=6000)
                         fc_info.value.set_files([str(p) for p in attachments])
                         logger.info(f"[gemini] Attached {len(attachments)} file(s) via direct '+' file chooser")
 
@@ -1970,6 +2645,10 @@ class ChatSession:
                             logger.info(f"[gemini] Downloaded image via context request: {local}")
 
                 if local and Path(local).exists() and Path(local).stat().st_size > 1000:
+                    # Strip the Gemini ✦ sparkle watermark if present. This is a
+                    # safe no-op when no watermark is confidently detected, so a
+                    # clean image is never altered.
+                    self._remove_gemini_watermark(local)
                     media.append({"type": "image", "url": src,
                                   "local_path": str(local)})
                     logger.info(f"[gemini] Image harvested OK ({Path(local).stat().st_size} bytes)")
@@ -1988,6 +2667,329 @@ class ChatSession:
             raise TimeoutError("No response received from Gemini within timeout")
 
         return {"text": last_text, "media": media}
+
+    # ------------------------------------------------------------------
+    # Gemini — Imagine (Omni/Veo) VIDEO generation
+    # ------------------------------------------------------------------
+
+    def _imagine_gemini(self, prompt: str, timeout: int,
+                        imagine_opts: dict,
+                        attachments: list[Path] = None) -> dict:
+        """Generate a VIDEO with the Gemini app (Omni/Veo), not a chat reply.
+
+        This is the Gemini counterpart to ``_imagine_grok``. The plain
+        ``_chat_gemini`` path only ever types a prompt and reads back TEXT —
+        that's exactly why the old pipeline produced a transcript instead of a
+        clip. Real video needs the dedicated "Create video" tool to be armed
+        BEFORE submitting:
+
+          1. Open a fresh chat at gemini.google.com.
+          2. Arm video mode: click the "+" / Add files button, then the
+             "Create video" / "Videos" item (several label/locale variants are
+             tried; falling back to the sidebar "Videos" entry).
+          3. Attach the scene still via the file chooser (image-to-video — the
+             still becomes the first frame).
+          4. Type the lip-sync prompt and Submit.
+          5. POLL for the result. Gemini video is ASYNC (minutes) and the chat
+             is locked while it renders, so we wait — per scene — up to a long
+             timeout, watching for a <video> element to appear.
+          6. Download the clip, then strip the visible ✦ sparkle watermark
+             per-frame with ``_remove_gemini_watermark_video`` (auto-detected
+             position). NOTE: the invisible SynthID watermark is embedded by
+             Google and cannot be removed from our side — only the visible
+             sparkle is.
+
+        imagine_opts keys honoured: ``aspect`` ("9:16"|"16:9"), ``duration``
+        ("6s" etc.). Resolution isn't exposed in the Gemini video UI.
+        """
+        page = self._page
+        if page is None:
+            raise RuntimeError("Gemini Imagine: no live browser page (Chrome tab not "
+                               "acquired). Cek profil Chrome / login di Bank.")
+        attachments = attachments or []
+        aspect = imagine_opts.get("aspect", "9:16")
+
+        self._dump_phase("gemini_imagine_01_start")
+
+        # ---- Fresh chat ----
+        try:
+            self.start_new_chat()
+            page.wait_for_timeout(1500)
+        except Exception as e:
+            logger.warning(f"[gemini-imagine] start_new_chat failed: {e}")
+
+        input_sel = ('div[contenteditable="true"], '
+                     'rich-textarea div[contenteditable="true"], textarea')
+        input_ready = False
+        try:
+            page.wait_for_selector(input_sel, timeout=25_000)
+            input_ready = True
+        except Exception:
+            logger.warning("[gemini-imagine] prompt input not found within 25s")
+        page.wait_for_timeout(800)
+
+        # If Gemini is showing a "video generating / chat locked" state from a
+        # previous run, or a login/limit wall, the input never appears. Surface
+        # that clearly instead of failing obscurely later.
+        if not input_ready:
+            body_txt = ""
+            try:
+                body_txt = (page.evaluate("() => document.body.innerText || ''") or "")[:400]
+            except Exception:
+                pass
+            self._dump_phase("gemini_imagine_01b_no_input")
+            raise RuntimeError(
+                "Gemini Imagine: kolom input tidak muncul. Kemungkinan chat "
+                "terkunci karena video sebelumnya masih diproses, atau perlu "
+                "login / kena limit. Cuplikan halaman: " + repr(body_txt[:200]))
+
+        for txt in ("Got it", "I agree", "Accept all", "No thanks", "Dismiss"):
+            try:
+                b = page.query_selector(f'button:has-text("{txt}")')
+                if b and b.is_visible():
+                    b.click(); page.wait_for_timeout(300)
+            except Exception:
+                pass
+
+        # ---- Arm "Create video" mode ----
+        def _arm_video_mode() -> bool:
+            # (a) Open the "+" / Add files menu.
+            opened = False
+            for sel in (
+                'button[aria-label*="Add files" i]',
+                'button[aria-label*="Upload" i]',
+                'button[aria-label*="Add" i]',
+                'button[aria-label*="More" i]',
+                'button:has-text("+")',
+            ):
+                try:
+                    el = page.query_selector(sel)
+                    if el and el.is_visible():
+                        el.click(); opened = True
+                        page.wait_for_timeout(700)
+                        break
+                except Exception:
+                    continue
+            # (b) Click a "Create video" / "Videos" menu item.
+            for item_text in ("Create video", "Create videos",
+                              "Create videos with Veo", "Videos", "Video"):
+                for sel in (
+                    f'[role="menuitem"]:has-text("{item_text}")',
+                    f'button:has-text("{item_text}")',
+                    f'li:has-text("{item_text}")',
+                    f'text="{item_text}"',
+                ):
+                    try:
+                        item = page.query_selector(sel)
+                        if item and item.is_visible():
+                            item.click()
+                            page.wait_for_timeout(1000)
+                            logger.info(f"[gemini-imagine] Armed video mode via '{item_text}'")
+                            return True
+                    except Exception:
+                        continue
+            # (c) Sidebar "Videos" entry as a last resort.
+            try:
+                side = page.query_selector('a[href*="video" i], [aria-label*="Video" i]')
+                if side and side.is_visible():
+                    side.click()
+                    page.wait_for_timeout(1200)
+                    logger.info("[gemini-imagine] Armed video mode via sidebar")
+                    return True
+            except Exception:
+                pass
+            return False
+
+        armed = _arm_video_mode()
+        if not armed:
+            logger.warning("[gemini-imagine] Could not arm 'Create video' mode — "
+                           "submitting may yield text only. Continuing best-effort.")
+        self._dump_phase("gemini_imagine_02_armed")
+
+        # ---- Optional aspect ratio selection ----
+        try:
+            target = aspect
+            label = "Portrait" if target == "9:16" else (
+                "Landscape" if target == "16:9" else None)
+            for cand in ([target] + ([label] if label else [])):
+                clicked = False
+                for sel in (
+                    f'button:has-text("{cand}")',
+                    f'[role="menuitem"]:has-text("{cand}")',
+                    f'[role="option"]:has-text("{cand}")',
+                ):
+                    try:
+                        el = page.query_selector(sel)
+                        if el and el.is_visible():
+                            el.click(); clicked = True
+                            page.wait_for_timeout(400)
+                            logger.info(f"[gemini-imagine] Aspect set: {cand}")
+                            break
+                    except Exception:
+                        continue
+                if clicked:
+                    break
+        except Exception as e:
+            logger.debug(f"[gemini-imagine] aspect select skipped: {e}")
+
+        # ---- Attach the still (image-to-video) ----
+        if attachments:
+            try:
+                attached = False
+                # After arming video mode the "Add image" affordance may be a
+                # direct file input or another menu entry.
+                for item_text in ("Add image", "Import files", "Upload files",
+                                  "Upload file", "From device"):
+                    for sel in (
+                        f'[role="menuitem"]:has-text("{item_text}")',
+                        f'button:has-text("{item_text}")',
+                        f'text="{item_text}"',
+                    ):
+                        try:
+                            item = page.query_selector(sel)
+                            if item and item.is_visible():
+                                with page.expect_file_chooser(timeout=5000) as fc:
+                                    item.click()
+                                fc.value.set_files([str(p) for p in attachments])
+                                attached = True
+                                logger.info(f"[gemini-imagine] Attached {len(attachments)} via menu")
+                                break
+                        except Exception:
+                            continue
+                    if attached:
+                        break
+                if not attached:
+                    # Fallback: a hidden <input type=file> may accept directly.
+                    try:
+                        finp = page.query_selector('input[type="file"]')
+                        if finp:
+                            finp.set_input_files([str(p) for p in attachments])
+                            attached = True
+                            logger.info("[gemini-imagine] Attached via hidden file input")
+                    except Exception:
+                        pass
+                if attached:
+                    page.wait_for_timeout(2500)  # let the upload settle
+                else:
+                    logger.warning("[gemini-imagine] Could not attach still; "
+                                   "video will be text-only.")
+            except Exception as e:
+                logger.warning(f"[gemini-imagine] attach failed (continuing): {e}")
+        self._dump_phase("gemini_imagine_03_attached")
+
+        # ---- Type the prompt ----
+        input_el = page.query_selector(input_sel)
+        if not input_el:
+            raise RuntimeError("Gemini Imagine: prompt input not found.")
+        input_el.click(); page.wait_for_timeout(200)
+        try:
+            page.keyboard.press("Control+a"); page.keyboard.press("Delete")
+        except Exception:
+            pass
+        page.wait_for_timeout(150)
+        self._type_multiline(page, prompt, delay=6)
+        page.wait_for_timeout(400)
+        self._dump_phase("gemini_imagine_04_typed")
+
+        # ---- Submit ----
+        sent = False
+        for sel in ('button[aria-label*="Send" i]',
+                    'button[aria-label*="Submit" i]',
+                    'button:has-text("Submit")',
+                    'button:has-text("Send")'):
+            try:
+                btn = page.query_selector(sel)
+                if btn and btn.is_enabled() and btn.is_visible():
+                    btn.click(); sent = True
+                    break
+            except Exception:
+                continue
+        if not sent:
+            page.keyboard.press("Enter")
+        self._dump_phase("gemini_imagine_05_sent")
+
+        # ---- Poll for the async video ----
+        # Gemini video takes minutes and locks the chat; wait per-scene.
+        effective_timeout = max(timeout, 360)
+        deadline = time.time() + effective_timeout
+        page.wait_for_timeout(4000)
+        last_log = 0.0
+        media: list[dict] = []
+
+        def _video_srcs() -> list[str]:
+            try:
+                return page.evaluate("""() => {
+                    const out = [];
+                    document.querySelectorAll('video').forEach(v => {
+                        const s = v.currentSrc || v.src || '';
+                        if (s) out.push(s);
+                        v.querySelectorAll('source').forEach(src => {
+                            if (src.src) out.push(src.src);
+                        });
+                    });
+                    return [...new Set(out)];
+                }""") or []
+            except Exception:
+                return []
+
+        def _is_rendering() -> bool:
+            try:
+                return page.evaluate("""() => {
+                    const t = (document.body.innerText || '');
+                    if (/generating|creating|rendering|membuat video|this may take/i.test(t))
+                        return true;
+                    const stop = document.querySelector(
+                        'button[aria-label*="Stop" i], button[aria-label*="Cancel" i]');
+                    if (stop) { const r = stop.getBoundingClientRect();
+                        if (r.width > 0 && r.height > 0) return true; }
+                    return false;
+                }""")
+            except Exception:
+                return False
+
+        while time.time() < deadline:
+            page.wait_for_timeout(3000)
+            srcs = _video_srcs()
+            # Ignore our own uploaded ref if it somehow appears as <video>;
+            # Gemini outputs are large generated clips, refs are stills.
+            if srcs and not _is_rendering():
+                for src in srcs:
+                    if src in [m.get("url") for m in media]:
+                        continue
+                    local = self._download_to_media(src, ".mp4")
+                    if local and Path(local).exists() and Path(local).stat().st_size > 50_000:
+                        # Strip the visible ✦ sparkle from every frame.
+                        dewm = False
+                        dewm_err = None
+                        try:
+                            dewm = self._remove_gemini_watermark_video(local)
+                        except Exception as e:
+                            dewm_err = str(e)
+                            logger.warning(f"[gemini-imagine] de-watermark failed: {e}")
+                        media.append({"type": "video", "url": src,
+                                      "local_path": str(local),
+                                      "dewatermarked": bool(dewm),
+                                      "dewatermark_error": dewm_err})
+                        logger.info(f"[gemini-imagine] Video harvested: {local} "
+                                    f"(dewatermarked={dewm})")
+                if media:
+                    break
+            if time.time() - last_log > 8:
+                logger.info("[gemini-imagine] waiting for video… "
+                            f"rendering={_is_rendering()} "
+                            f"remaining={int(deadline - time.time())}s")
+                last_log = time.time()
+                self._dump_phase("gemini_imagine_06_waiting")
+
+        if not media:
+            debug = self._save_debug_artifacts(tag="gemini_imagine_no_video")
+            logger.error(f"[gemini-imagine] No video produced. Debug: {debug}")
+            raise TimeoutError(
+                "Gemini did not return a video within the timeout. The 'Create "
+                "video' mode may not be available on this account/region, or "
+                "generation took too long.")
+
+        return {"text": "", "media": media}
 
     # ------------------------------------------------------------------
     # Grok
@@ -3158,6 +4160,12 @@ class BridgeWorker:
             )
             self._thread.start()
             self._started = True
+        # Wait briefly until the thread is actually alive so that an immediate
+        # follow-up call (e.g. set_cdp_url) doesn't race is_running() == False.
+        for _ in range(100):  # up to ~1s
+            if self._thread is not None and self._thread.is_alive():
+                break
+            time.sleep(0.01)
 
     def shutdown(self, wait: bool = True, timeout: float = 10):
         """Signal the worker to close everything and exit."""
@@ -3201,12 +4209,46 @@ class BridgeWorker:
 
     def _run_loop(self):
         logger.info("BridgeWorker thread started")
+        # Playwright's sync API refuses to start on a thread that already has a
+        # running/!current asyncio event loop ("Sync API inside the asyncio
+        # loop"). A fresh worker thread normally has none, but to be robust
+        # against libraries that install a loop on import (or a reused thread),
+        # explicitly give THIS thread its own clean event loop that is NOT
+        # running. sync_playwright then drives its own loop without conflict.
+        try:
+            import asyncio as _asyncio
+            try:
+                _existing = _asyncio.get_event_loop()
+                if _existing.is_running():
+                    # A running loop here would break sync Playwright; replace it.
+                    _asyncio.set_event_loop(_asyncio.new_event_loop())
+            except RuntimeError:
+                # No current loop on this thread — give it a fresh idle one.
+                _asyncio.set_event_loop(_asyncio.new_event_loop())
+        except Exception as _e:
+            logger.debug(f"BridgeWorker asyncio loop setup skipped: {_e}")
         try:
             while True:
                 cmd = self._queue.get()
                 if cmd is self._SHUTDOWN:
                     break
                 op, args, kwargs, holder, done = cmd
+                # A previous op (e.g. the Gemini google-genai client, which is
+                # async-first) can leave a RUNNING asyncio loop installed on
+                # THIS thread. The next sync_playwright()/connect_over_cdp call
+                # then dies with "Sync API inside the asyncio loop". Guarantee a
+                # clean, non-running loop before EVERY op — not just at thread
+                # start — so each job begins from a known-good state.
+                try:
+                    import asyncio as _asyncio
+                    try:
+                        _loop = _asyncio.get_event_loop_policy().get_event_loop()
+                        if _loop.is_running() or _loop.is_closed():
+                            raise RuntimeError("replace")
+                    except Exception:
+                        _asyncio.set_event_loop(_asyncio.new_event_loop())
+                except Exception as _e:
+                    logger.debug(f"loop reset skipped: {_e}")
                 try:
                     self._ensure_pool()
                     holder["result"] = op(self._pool, *args, **kwargs)

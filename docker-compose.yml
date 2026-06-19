@@ -1,0 +1,73 @@
+# FakeFluencer V2 — Docker Compose
+#
+#   web     : Flask UI + Playwright engine (connects to Chrome over CDP)
+#   chrome  : N Google Chrome profiles + noVNC for login
+#
+# Shared, PERSISTENT data lives in bind mounts so it survives rebuilds and is
+# easy to back up / copy:
+#   ./profiles  → each account's Chrome profile (login persists here)
+#   ./media     → generated images / videos / zips
+#   ./uploads   → uploaded reference photos
+#   ./profiles.json → the account ↔ CDP-port map (written by the web UI)
+#
+# Quick start:
+#   docker compose up -d --build
+#   open  http://SERVER_IP:5000/dashboard   → add profiles in Bank
+#   docker compose restart chrome           → launch the new Chrome(s)
+#   open  http://SERVER_IP:6080             → noVNC: log in to each profile
+#
+# SECURITY: do not expose ports 5000/6080 to the public internet without a
+# tunnel (Tailscale / SSH -L / Cloudflare Tunnel) or a reverse proxy with auth.
+
+services:
+  chrome:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.chrome
+    container_name: ff_chrome
+    shm_size: "2gb"           # Chrome needs generous /dev/shm or it crashes
+    environment:
+      PROFILES_JSON: /config/profiles.json
+      PROFILES_DIR: /profiles
+      SCREEN_GEOMETRY: 1600x900x24
+      # The hostname the `web` container uses to reach this service. Must match
+      # the web service's CDP_HOST so the rewritten webSocketDebuggerUrl is
+      # reachable from the web container.
+      CDP_PUBLIC_HOST: chrome
+    volumes:
+      - ./profiles:/profiles
+      - ./profiles.json:/config/profiles.json
+    ports:
+      - "6080:6080"           # noVNC (login screen)
+      # CDP ports stay on the internal network; the web container reaches them
+      # by service name. Expose here only if you want to debug from the host.
+    networks:
+      - ffnet
+    restart: unless-stopped
+
+  web:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.web
+    container_name: ff_web
+    environment:
+      CDP_HOST: chrome                 # reach the chrome service over the network
+      PROFILES_JSON: /app/profiles.json
+      PROFILES_DIR: /app/profiles
+    volumes:
+      - ./:/app                        # live code + shared data
+      - ./profiles:/app/profiles
+      - ./media:/app/media
+      - ./uploads:/app/uploads
+      - ./profiles.json:/app/profiles.json
+    ports:
+      - "5000:5000"                    # web UI
+    depends_on:
+      - chrome
+    networks:
+      - ffnet
+    restart: unless-stopped
+
+networks:
+  ffnet:
+    driver: bridge

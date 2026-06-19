@@ -4,3 +4,8 @@ playwright>=1.40.0
 requests>=2.31.0
 # Optional: enable JPG/WebP thumbnail previews in the chat tab
 Pillow>=10.0.0
+# Gemini watermark removal (sparkle ✦ detection + inpaint for images, and
+# frame sampling for video delogo). Needs the system libs libgl1/libglib2.0-0
+# (installed in Dockerfile.web) plus ffmpeg for the video path.
+opencv-python-headless>=4.8.0
+numpy>=1.24.0

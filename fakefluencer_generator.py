@@ -246,6 +246,61 @@ MODES: dict[str, dict] = {
         "camera": "Clean studio multi-angle character sheet, neutral background.",
         "style": "Consistent digital character base for repeatable content.",
     },
+    # ── Mode khusus VIDEO LIVE (loopable, gerak halus, dialog minimal) ──
+    "live_ambience": {
+        "label": "🔴 Live: Ambience Loop",
+        "needs": ("model",),
+        "camera": "Locked-off or very slow gentle camera, host seated/relaxed, "
+                  "subtle natural movement (breathing, blinking, small gestures).",
+        "style": "Calm looping ambience for a live stream background. Seamless, "
+                 "no abrupt cuts, designed to loop for a long time without feeling "
+                 "repetitive. Soft warm lighting.",
+        "live": True,
+        "dialog": "none",   # default no spoken line
+        "live_hint": "This is a LOOPING LIVE BACKGROUND, not an ad. The host just "
+                     "exists calmly on screen. Motion must be minimal and smooth so "
+                     "the clip can repeat seamlessly. No selling, no call to action.",
+    },
+    "live_standby": {
+        "label": "🔴 Live: Standby / BRB",
+        "needs": ("model",),
+        "camera": "Static friendly framing, host waving or gesturing 'wait a moment', "
+                  "or empty cozy set if no host.",
+        "style": "A 'Be Right Back' / standby screen for a live stream. Warm, inviting, "
+                 "reassuring. Space for on-screen text like 'Sebentar ya'.",
+        "live": True,
+        "dialog": "short",  # short reassuring line
+        "live_hint": "This is a STANDBY screen shown while the host is away. Mood is "
+                     "warm and reassuring. Keep it loopable. The spoken line (if any) "
+                     "is a single short reassurance, not a sales pitch.",
+    },
+    "live_showcase": {
+        "label": "🔴 Live: Product Showcase Loop",
+        "needs": ("product",),
+        "camera": "Slow 360° turntable or gentle orbit around the product, clean "
+                  "surface, soft studio light, macro detail passes.",
+        "style": "Looping product beauty-shots for a live stream: the product rotates "
+                 "and is shown from multiple angles so the host can talk over it. "
+                 "Seamless loop, premium lighting.",
+        "live": True,
+        "dialog": "none",
+        "live_hint": "This is a LOOPING PRODUCT SHOWCASE for live, NOT a scripted ad. "
+                     "Just beautiful rotating/close-up shots of the product. No host "
+                     "dialog needed — the live host talks over it.",
+    },
+    "live_intro": {
+        "label": "🔴 Live: Intro / Welcome",
+        "needs": ("model",),
+        "camera": "Friendly medium shot, host greeting and waving to camera, lively "
+                  "but loopable energy.",
+        "style": "A short welcome/opening loop greeting viewers who just joined the "
+                 "live. Friendly, energetic, repeatable.",
+        "live": True,
+        "dialog": "short",
+        "live_hint": "This is a WELCOME loop for viewers entering the live. The host "
+                     "greets the audience warmly. Keep it short and loopable; one "
+                     "friendly greeting line, no product selling.",
+    },
 }
 
 # Voice profiles -> a stable, fully-specified description that we paste
@@ -352,6 +407,20 @@ def build_chatgpt_prompt(
     if extra_notes:
         role_lines.append(f"Extra direction: {extra_notes}")
 
+    # ── LIVE modes: this is loopable background content, not an ad. ──
+    is_live = bool(m.get("live"))
+    dialog_mode = m.get("dialog", "full")  # "none" | "short" | "full"
+    if is_live:
+        role_lines.append("Extra direction: " + m.get("live_hint", ""))
+        if dialog_mode == "none":
+            role_lines.append(
+                "This content has NO spoken dialogue. Leave every 'spoken' field "
+                "as an empty string. Describe only the visual action.")
+        elif dialog_mode == "short":
+            role_lines.append(
+                "Each 'spoken' line must be ONE very short friendly sentence "
+                "(a greeting or reassurance), not a sales pitch.")
+
     # Structure guidance MUST match the requested scene count. The old text
     # always demanded "Scene 1 = HOOK, last = CTA", which implicitly forced a
     # 3-beat ad even when num_scenes==1 — so the model returned 3 scenes.
@@ -369,6 +438,30 @@ def build_chatgpt_prompt(
             "any middle scenes are BODY."
         )
 
+    # Live modes are loopable background clips, not an ad arc.
+    if is_live:
+        if num_scenes <= 1:
+            structure_clause = (
+                "Produce EXACTLY 1 scene object with role \"LOOP\" — a single "
+                "seamless looping shot. The scenes array must have length 1."
+            )
+        else:
+            structure_clause = (
+                f"Produce EXACTLY {num_scenes} scene objects, each role \"LOOP\". "
+                "They are independent loopable clips of the same scene (different "
+                "small variations), NOT a story with hook and call to action."
+            )
+
+    spoken_rule = (
+        "Each 'spoken' line must be 1-2 sentences, natural spoken Indonesian, "
+        "and must be consistent in personality with the same single speaker. "
+    )
+    if is_live and dialog_mode == "none":
+        spoken_rule = "Every 'spoken' field must be an empty string \"\". "
+    elif is_live and dialog_mode == "short":
+        spoken_rule = ("Each 'spoken' line must be ONE short friendly sentence "
+                       "in casual Indonesian (greeting or reassurance only). ")
+
     schema = (
         "Reply with ONE valid JSON object and NOTHING else — no markdown, "
         "no backticks, no commentary. Schema:\n"
@@ -377,14 +470,13 @@ def build_chatgpt_prompt(
         '  "product_name": "<product line + variant in Indonesian, e.g. White Cell DNA Toner>",\n'
         '  "size_ml": <numeric ml from the label as a number, e.g. 50 — or null if not visible>,\n'
         '  "scenes": [\n'
-        '    { "role": "HOOK|BODY|CTA",\n'
+        '    { "role": "HOOK|BODY|CTA|LOOP",\n'
         '      "spoken": "<the exact words the model says, in casual Indonesian>",\n'
         '      "action": "<one short line describing what is shown on screen>" }\n'
         "  ]\n"
         "}\n"
         + structure_clause + " "
-        "Each 'spoken' line must be 1-2 sentences, natural spoken Indonesian, "
-        "and must be consistent in personality with the same single speaker. "
+        + spoken_rule +
         "Do not include emojis. Do not include the brand more than necessary."
     )
 
@@ -442,6 +534,25 @@ def build_scene_image_prompt(
         negatives += (
             ", no oversized or giant bottle, bottle not larger than realistic "
             "for its volume, no distorted or unrealistic product scale"
+        )
+
+    # ── LIVE modes: loopable background still, dialog framing optional ──
+    if m.get("live"):
+        spoken_clause = ""
+        if m.get("dialog") != "none" and spoken:
+            spoken_clause = (f"The host has a friendly natural expression "
+                             f"(do not render text): \"{spoken}\". ")
+        return (
+            f"Create a single photoreal vertical image for a LIVE STREAM "
+            f"background. Combine {ref_clause} into one natural frame.{prod}{scale_clause} "
+            f"Camera: {m['camera']} "
+            f"Setting/background: {background}. "
+            f"On-screen moment: {scene_action} "
+            f"{spoken_clause}"
+            f"Style: {m['style']} "
+            f"Composition must work as a calm seamless loop, centered subject, "
+            f"clean negative space. Aspect ratio {aspect}. Soft warm lighting, "
+            f"{negatives}."
         )
 
     return (

@@ -32,6 +32,8 @@ from platforms import PLATFORMS, CaptureResult
 
 import fakefluencer_generator as ffgen
 
+import live_module
+
 try:
     from extension_server import run_server_in_thread as run_extension_server
     EXTENSION_SERVER_IMPORT_ERROR = None
@@ -374,6 +376,10 @@ class AIChatBridgeApp:
         gen_tab = ttk.Frame(self.main_notebook, padding=12)
         self.main_notebook.add(gen_tab, text="  🎬 Generator  ")
         self._build_generator_tab(gen_tab)
+
+        live_tab = ttk.Frame(self.main_notebook, padding=12)
+        self.main_notebook.add(live_tab, text="  🔴 LIVE  ")
+        self._build_live_tab(live_tab)
 
         api_tab = ttk.Frame(self.main_notebook, padding=12)
         self.main_notebook.add(api_tab, text="  API Server  ")
@@ -2181,6 +2187,272 @@ class AIChatBridgeApp:
         save_config(self.cfg)
         self._log("✅ Real Chrome settings disimpan.", "info")
 
+    # ════════════════════════════════════════════════════════════════
+    #  LIVE TAB — auto-jawab komentar TikTok (suara) + buat video live
+    # ════════════════════════════════════════════════════════════════
+    def _build_live_tab(self, parent):
+        """Tab LIVE: kiri = auto-reply komentar (suara), kanan = video live."""
+        self._live_ctrl = None  # LiveReplyController, dibuat saat Start
+
+        split = ttk.Frame(parent)
+        split.pack(fill="both", expand=True)
+        left = ttk.Frame(split)
+        left.pack(side="left", fill="both", expand=True, padx=(0, 6))
+        right = ttk.Frame(split)
+        right.pack(side="left", fill="both", expand=True, padx=(6, 0))
+
+        # ── KIRI: Auto-reply komentar ────────────────────────────────
+        reply_box = ttk.LabelFrame(left, text="🎙 Auto-jawab komentar (suara)", padding=8)
+        reply_box.pack(fill="x")
+
+        row1 = ttk.Frame(reply_box); row1.pack(fill="x", pady=2)
+        ttk.Label(row1, text="Username TikTok:").pack(side="left")
+        self.live_user_var = tk.StringVar(value=self.cfg.get("live_user", ""))
+        ttk.Entry(row1, textvariable=self.live_user_var, width=22).pack(side="left", padx=6)
+        ttk.Label(row1, text="(akun yang sedang LIVE)", style="Dim.TLabel").pack(side="left")
+
+        row2 = ttk.Frame(reply_box); row2.pack(fill="x", pady=2)
+        ttk.Label(row2, text="AI penjawab:").pack(side="left")
+        self.live_ai_var = tk.StringVar(value=self.cfg.get("live_ai", "grok"))
+        ttk.Combobox(row2, textvariable=self.live_ai_var, width=10, state="readonly",
+                     values=["grok", "chatgpt", "gemini"]).pack(side="left", padx=6)
+        ttk.Label(row2, text="Suara:").pack(side="left", padx=(8, 0))
+        self.live_voice_var = tk.StringVar(value=live_module.INDO_VOICES[0])
+        ttk.Combobox(row2, textvariable=self.live_voice_var, width=24, state="readonly",
+                     values=live_module.INDO_VOICES).pack(side="left", padx=6)
+
+        row3 = ttk.Frame(reply_box); row3.pack(fill="x", pady=2)
+        ttk.Label(row3, text="Output suara:").pack(side="left")
+        self.live_device_var = tk.StringVar(value="(speaker default)")
+        devices = ["(speaker default)"] + live_module.list_output_devices()
+        ttk.Combobox(row3, textvariable=self.live_device_var, width=30, state="readonly",
+                     values=devices).pack(side="left", padx=6)
+        ttk.Label(row3, text="pilih VB-CABLE agar penonton dengar", style="Dim.TLabel").pack(side="left")
+
+        row4 = ttk.Frame(reply_box); row4.pack(fill="x", pady=2)
+        ttk.Label(row4, text="Maks. karakter jawaban:").pack(side="left")
+        self.live_maxchars_var = tk.StringVar(value="220")
+        ttk.Entry(row4, textvariable=self.live_maxchars_var, width=6).pack(side="left", padx=6)
+        self.live_gifts_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row4, text="Ucapkan terima kasih saat ada gift",
+                        variable=self.live_gifts_var).pack(side="left", padx=8)
+
+        ttk.Label(reply_box, text="Gaya jawaban (persona):", style="Dim.TLabel").pack(anchor="w", pady=(6, 0))
+        self.live_persona_txt = tk.Text(reply_box, height=4, wrap="word",
+                                        bg=self._theme["bg3"], fg=self._theme["fg_bright"],
+                                        insertbackground=self._theme["fg_bright"],
+                                        relief="flat", font=("Segoe UI", 9))
+        self.live_persona_txt.pack(fill="x", pady=(2, 6))
+        self.live_persona_txt.insert("1.0", live_module.DEFAULT_PERSONA)
+
+        btns = ttk.Frame(reply_box); btns.pack(fill="x")
+        self.live_start_btn = ttk.Button(btns, text="🔴 Mulai jawab komentar",
+                                         style="Accent.TButton", command=self._live_start)
+        self.live_start_btn.pack(side="left")
+        self.live_stop_btn = ttk.Button(btns, text="■ Stop", command=self._live_stop,
+                                        state="disabled")
+        self.live_stop_btn.pack(side="left", padx=6)
+        ttk.Button(btns, text="⬇ Install dependency",
+                   command=self._live_install_deps).pack(side="left", padx=6)
+        self.live_status_var = tk.StringVar(value="● Berhenti")
+        ttk.Label(reply_box, textvariable=self.live_status_var,
+                  foreground=self._theme["fg_dim"]).pack(anchor="w", pady=(6, 0))
+
+        # transcript komentar→jawaban
+        tr_box = ttk.LabelFrame(left, text="Transkrip komentar → jawaban", padding=6)
+        tr_box.pack(fill="both", expand=True, pady=(8, 0))
+        self.live_transcript = tk.Text(tr_box, wrap="word", state="disabled",
+                                       bg=self._theme["bg3"], fg=self._theme["fg"],
+                                       relief="flat", font=("Segoe UI", 9))
+        self.live_transcript.pack(fill="both", expand=True)
+
+        # ── KANAN: Buat video live ───────────────────────────────────
+        vid_box = ttk.LabelFrame(right, text="🎬 Buat video untuk LIVE (gabung scene)", padding=8)
+        vid_box.pack(fill="x")
+        ttk.Label(vid_box,
+                  text="Gabungkan scene .mp4 hasil Generator jadi satu video panjang\n"
+                       "yang siap dipasang sebagai source Video di TikTok LIVE.",
+                  style="Dim.TLabel", justify="left").pack(anchor="w", pady=(0, 6))
+
+        fr = ttk.Frame(vid_box); fr.pack(fill="x", pady=2)
+        ttk.Label(fr, text="Folder/Scene:").pack(side="left")
+        self.live_vsrc_var = tk.StringVar(value=str(MEDIA_DIR / "generated"))
+        ttk.Entry(fr, textvariable=self.live_vsrc_var, width=28).pack(side="left", padx=6)
+        ttk.Button(fr, text="📁", width=3,
+                   command=self._live_pick_video_folder).pack(side="left")
+
+        fr2 = ttk.Frame(vid_box); fr2.pack(fill="x", pady=2)
+        ttk.Label(fr2, text="Orientasi:").pack(side="left")
+        self.live_portrait_var = tk.StringVar(value="portrait")
+        ttk.Radiobutton(fr2, text="Vertikal (TikTok)", value="portrait",
+                        variable=self.live_portrait_var).pack(side="left", padx=4)
+        ttk.Radiobutton(fr2, text="Horizontal", value="landscape",
+                        variable=self.live_portrait_var).pack(side="left", padx=4)
+
+        fr3 = ttk.Frame(vid_box); fr3.pack(fill="x", pady=2)
+        self.live_loop_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(fr3, text="Ulang sampai durasi (menit):",
+                        variable=self.live_loop_var).pack(side="left")
+        self.live_loopmin_var = tk.StringVar(value="5")
+        ttk.Entry(fr3, textvariable=self.live_loopmin_var, width=5).pack(side="left", padx=6)
+
+        fr4 = ttk.Frame(vid_box); fr4.pack(fill="x", pady=2)
+        ttk.Label(fr4, text="Simpan ke:").pack(side="left")
+        self.live_vout_var = tk.StringVar(value=str(MEDIA_DIR / "generated" / "live_video.mp4"))
+        ttk.Entry(fr4, textvariable=self.live_vout_var, width=28).pack(side="left", padx=6)
+        ttk.Button(fr4, text="📁", width=3,
+                   command=self._live_pick_video_out).pack(side="left")
+
+        self.live_merge_btn = ttk.Button(vid_box, text="🎬 Gabungkan video",
+                                         style="Accent.TButton", command=self._live_merge)
+        self.live_merge_btn.pack(anchor="w", pady=(6, 0))
+
+        # log live
+        log_box = ttk.LabelFrame(right, text="Log LIVE", padding=6)
+        log_box.pack(fill="both", expand=True, pady=(8, 0))
+        self.live_log = tk.Text(log_box, wrap="word", state="disabled",
+                                bg=self._theme["bg3"], fg=self._theme["fg"],
+                                relief="flat", font=("Consolas", 9))
+        self.live_log.pack(fill="both", expand=True)
+
+    def _live_log_msg(self, msg: str):
+        def _w():
+            self.live_log.configure(state="normal")
+            self.live_log.insert("end", msg + "\n")
+            self.live_log.see("end")
+            self.live_log.configure(state="disabled")
+        self.root.after(0, _w)
+
+    def _live_add_transcript(self, username: str, comment: str, answer: str):
+        def _w():
+            self.live_transcript.configure(state="normal")
+            self.live_transcript.insert("end", f"💬 {username}: {comment}\n")
+            self.live_transcript.insert("end", f"🤖 {answer}\n\n")
+            self.live_transcript.see("end")
+            self.live_transcript.configure(state="disabled")
+        self.root.after(0, _w)
+
+    def _live_start(self):
+        user = self.live_user_var.get().strip()
+        if not user:
+            messagebox.showwarning("LIVE", "Isi username TikTok dulu.")
+            return
+        try:
+            maxc = int(self.live_maxchars_var.get())
+        except ValueError:
+            maxc = 220
+        device = self.live_device_var.get()
+        device = None if device.startswith("(") else device
+        persona = self.live_persona_txt.get("1.0", "end").strip()
+
+        # simpan preferensi
+        self.cfg["live_user"] = user
+        self.cfg["live_ai"] = self.live_ai_var.get()
+        save_config(self.cfg)
+
+        if self._live_ctrl is None:
+            self._live_ctrl = live_module.LiveReplyController(
+                ensure_bridge=self._ensure_bridge_for,
+                log=self._live_log_msg,
+                on_comment=self._live_add_transcript,
+            )
+        self._live_log_msg("🔴 Menyambung ke LIVE...")
+        self._live_ctrl.start(
+            username=user,
+            ai_model=self.live_ai_var.get(),
+            label="default",
+            voice=live_module.voice_id(self.live_voice_var.get()),
+            persona=persona,
+            device_match=device,
+            max_chars=maxc,
+            reply_gifts=self.live_gifts_var.get(),
+        )
+        self.live_start_btn.configure(state="disabled")
+        self.live_stop_btn.configure(state="normal")
+        self.live_status_var.set("● Berjalan")
+        # pantau kalau koneksi putus sendiri
+        self._live_watch_status()
+
+    def _live_watch_status(self):
+        if self._live_ctrl and not self._live_ctrl.is_running:
+            self.live_start_btn.configure(state="normal")
+            self.live_stop_btn.configure(state="disabled")
+            self.live_status_var.set("● Berhenti")
+            return
+        self.root.after(1500, self._live_watch_status)
+
+    def _live_stop(self):
+        if self._live_ctrl:
+            self._live_ctrl.stop()
+        self.live_start_btn.configure(state="normal")
+        self.live_stop_btn.configure(state="disabled")
+        self.live_status_var.set("● Berhenti")
+
+    def _live_install_deps(self):
+        self._live_log_msg("⬇ Menginstall TikTokLive + edge-tts + sounddevice...")
+
+        def worker():
+            try:
+                proc = subprocess.run(
+                    [sys.executable, "-m", "pip", "install",
+                     "TikTokLive", "edge-tts", "sounddevice", "soundfile", "playsound==1.2.2"],
+                    capture_output=True, text=True)
+                if proc.returncode == 0:
+                    self._live_log_msg("✅ Dependency terpasang. Coba mulai lagi.")
+                else:
+                    self._live_log_msg("✗ Gagal install:\n" + proc.stderr[-800:])
+            except Exception as e:
+                self._live_log_msg(f"✗ Install error: {e}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _live_pick_video_folder(self):
+        d = filedialog.askdirectory(title="Pilih folder berisi scene .mp4")
+        if d:
+            self.live_vsrc_var.set(d)
+
+    def _live_pick_video_out(self):
+        f = filedialog.asksaveasfilename(
+            title="Simpan video live", defaultextension=".mp4",
+            filetypes=[("MP4", "*.mp4")])
+        if f:
+            self.live_vout_var.set(f)
+
+    def _live_merge(self):
+        src = Path(self.live_vsrc_var.get().strip())
+        out = Path(self.live_vout_var.get().strip())
+        if not src.exists():
+            messagebox.showwarning("Video", "Folder/scene tidak ditemukan.")
+            return
+        loop_to = None
+        if self.live_loop_var.get():
+            try:
+                loop_to = float(self.live_loopmin_var.get()) * 60.0
+            except ValueError:
+                loop_to = None
+        portrait = self.live_portrait_var.get() == "portrait"
+        if src.is_dir():
+            paths = sorted(p for p in src.iterdir()
+                           if p.suffix.lower() in live_module.VIDEO_EXTS)
+        else:
+            paths = [src]
+        if not paths:
+            messagebox.showwarning("Video", "Tidak ada file video di lokasi itu.")
+            return
+
+        self.live_merge_btn.configure(state="disabled")
+        self._live_log_msg(f"🎬 Menggabungkan {len(paths)} klip...")
+
+        def worker():
+            try:
+                live_module.merge_scene_videos(
+                    paths, out, self._live_log_msg,
+                    loop_to=loop_to, portrait=portrait)
+            finally:
+                self.root.after(0, lambda: self.live_merge_btn.configure(state="normal"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def _build_api_tab(self, parent):
         info = ttk.LabelFrame(parent, text="OpenAI-Compatible API Server (multimodal + continuity)", padding=8)
         info.pack(fill="x", pady=(0, 8))
@@ -2627,7 +2899,7 @@ class AIChatBridgeApp:
 
             def stream_logs():
                 for line in iter(self._api_process.stdout.readline, b''):
-                    self._enqueue_log(f"[API] {line.decode().strip()}")
+                    self._enqueue_log(f"[API] {line.decode('utf-8', errors='replace').strip()}")
             threading.Thread(target=stream_logs, daemon=True).start()
         except Exception as e:
             self._log(f"Failed to start API: {e}", "error")

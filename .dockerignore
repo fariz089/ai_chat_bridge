@@ -1,0 +1,27 @@
+# Virtualenv / Python cache
+.venv
+venv
+__pycache__
+*.pyc
+*.pyo
+
+# VCS
+.git
+.gitignore
+
+# Dev / debug artifacts
+debug
+
+# ── Runtime data — bind-mounted by docker-compose, must NOT enter the image ──
+# These contain Chrome profile locks (SingletonCookie, etc.) that are Unix
+# sockets and break `COPY . /app`. They also bloat the build context.
+profiles
+profiles/*
+media/generated/*
+uploads/web/*
+sessions/*.json
+
+# Build outputs / OS junk
+*.zip
+.DS_Store
+Thumbs.db

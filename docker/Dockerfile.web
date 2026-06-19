@@ -1,0 +1,33 @@
+# Web container: the Flask UI + the Playwright engine that drives the Chrome
+# instances in the `chrome` container over CDP. No browser is installed here —
+# Playwright only CONNECTS over CDP, it doesn't launch anything locally.
+FROM python:3.11-slim-bookworm
+
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+# System libraries needed for watermark removal:
+#   ffmpeg            -> video de-watermark (delogo) + frame sampling/probe
+#   libGL/glib        -> runtime libs required by opencv-python (cv2)
+# Without these, cv2 import fails and ffmpeg is absent, so BOTH the image and
+# video Gemini watermark removal silently no-op (the watermark stays).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ffmpeg \
+        libgl1 \
+        libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Python deps. Playwright's Python package is needed (the client side of CDP),
+# but we do NOT run `playwright install` — no local browser required.
+COPY requirements.txt /app/requirements.txt
+COPY webapp/requirements-web.txt /app/webapp/requirements-web.txt
+RUN pip install --no-cache-dir -r requirements.txt \
+    && pip install --no-cache-dir -r webapp/requirements-web.txt
+
+# App code (mounted as a volume in compose for dev; copied for standalone use)
+COPY . /app
+
+EXPOSE 5000
+CMD ["python", "webapp/app.py", "--host", "0.0.0.0", "--port", "5000"]

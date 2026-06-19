@@ -1,0 +1,41 @@
+# Chrome container: runs N Google Chrome instances (one per profile), each
+# exposing a CDP port, all visible on one virtual display published via noVNC.
+FROM python:3.11-slim-bookworm
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    DISPLAY=:99 \
+    SCREEN_GEOMETRY=1600x900x24
+
+# system deps: X virtual framebuffer, VNC, noVNC, fonts, Chrome deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        wget gnupg ca-certificates \
+        xvfb x11vnc x11-utils \
+        fluxbox \
+        novnc websockify \
+        fonts-liberation fonts-noto-color-emoji \
+        socat \
+        dumb-init procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# Google Chrome (stable)
+RUN wget -q -O /tmp/chrome.deb \
+        https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends /tmp/chrome.deb \
+    && rm -f /tmp/chrome.deb \
+    && rm -rf /var/lib/apt/lists/*
+
+# noVNC convenience symlink
+RUN ln -sf /usr/share/novnc/vnc.html /usr/share/novnc/index.html
+
+WORKDIR /app
+COPY chrome_supervisor.py /app/chrome_supervisor.py
+COPY cdp_proxy.py /app/cdp_proxy.py
+COPY docker/chrome-entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
+# 6080 = noVNC web; 9301-9400 = CDP ports for the profiles
+EXPOSE 6080 9301 9302 9303 9304 9305 9306 9307 9308
+
+ENTRYPOINT ["/usr/bin/dumb-init", "--"]
+CMD ["/app/entrypoint.sh"]

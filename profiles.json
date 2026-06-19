@@ -1,0 +1,14 @@
+[
+  {
+    "id": "gemini_gemini",
+    "platform": "gemini",
+    "label": "Gemini",
+    "port": 9301
+  },
+  {
+    "id": "grok_grok",
+    "platform": "grok",
+    "label": "Grok",
+    "port": 9302
+  }
+]
